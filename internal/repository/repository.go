@@ -14,6 +14,7 @@ type DownloadRepository interface {
 	Create(ctx context.Context, d *model.Download) error
 	GetByID(ctx context.Context, id string) (*model.Download, error)
 	ListByChat(ctx context.Context, chatID int64, limit int) ([]*model.Download, error)
+	ListAll(ctx context.Context) ([]*model.Download, error)
 	UpdateStatus(ctx context.Context, id string, status model.DownloadStatus, errMsg string) error
 	UpdateProgress(ctx context.Context, id string, progress float64) error
 	ListPending(ctx context.Context, limit int) ([]*model.Download, error)
@@ -69,6 +70,32 @@ func (r *SQLiteDownloadRepository) ListByChat(ctx context.Context, chatID int64,
 	rows, err := r.db.QueryContext(ctx, query, chatID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("listing downloads: %w", err)
+	}
+	defer rows.Close()
+
+	var downloads []*model.Download
+	for rows.Next() {
+		d := &model.Download{}
+		var completedAt sql.NullTime
+		if err := rows.Scan(&d.ID, &d.ChatID, &d.UserID, &d.URL, &d.FilePath, &d.Status, &d.Progress, &d.Error,
+			&d.FileSize, &d.CreatedAt, &d.UpdatedAt, &completedAt); err != nil {
+			return nil, fmt.Errorf("scanning download: %w", err)
+		}
+		if completedAt.Valid {
+			d.CompletedAt = &completedAt.Time
+		}
+		downloads = append(downloads, d)
+	}
+	return downloads, rows.Err()
+}
+
+// ListAll retrieves all downloads.
+func (r *SQLiteDownloadRepository) ListAll(ctx context.Context) ([]*model.Download, error) {
+	query := `SELECT id, chat_id, user_id, url, file_path, status, progress, error, file_size, created_at, updated_at, completed_at
+		FROM downloads ORDER BY created_at DESC`
+	rows, err := r.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("listing all downloads: %w", err)
 	}
 	defer rows.Close()
 

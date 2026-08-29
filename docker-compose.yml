@@ -1,0 +1,31 @@
+services:
+  telecli:
+    build:
+      context: .
+      dockerfile: Containerfile
+    image: go-user-tele-downloader:latest
+    container_name: telecli
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      - TELEGRAM_PHONE=${TELEGRAM_PHONE}
+      # 2FA password (if enabled)
+      - TELEGRAM_PASSWORD=${TELEGRAM_PASSWORD}
+      # Verification code for first-time authentication (can be removed after)
+      - TELEGRAM_VERIFICATION_CODE=${TELEGRAM_VERIFICATION_CODE}
+      # Session encryption password (only if no 2FA)
+      - SESSION_ENCRYPTION_PASSWORD=${SESSION_ENCRYPTION_PASSWORD}
+      # Channels to monitor (comma-separated)
+      - MONITOR_CHANNELS=${MONITOR_CHANNELS}
+      - MAX_CONCURRENT_DOWNLOADS=${MAX_CONCURRENT_DOWNLOADS:-3}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    volumes:
+      # Persistent data (sessions, downloads, database)
+      - telecli-data:/data
+    # Interactive mode for first-time authentication (code entry)
+    stdin_open: true
+    tty: true
+
+volumes:
+  telecli-data:

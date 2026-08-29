@@ -106,3 +106,8 @@ func (s *DownloadService) DownloadFilePath(filename string) string {
 func (s *DownloadService) UpdateDownloadStatus(ctx context.Context, id string, status model.DownloadStatus, errMsg string) error {
 	return s.repo.UpdateStatus(ctx, id, status, errMsg)
 }
+
+// UpdateDownloadProgress updates the progress of a download.
+func (s *DownloadService) UpdateDownloadProgress(ctx context.Context, id string, progress float64) error {
+	return s.repo.UpdateProgress(ctx, id, progress)
+}

@@ -12,11 +12,12 @@ import (
 // Config holds all configuration for the application.
 type Config struct {
 	// MTProto authentication
-	APIID       int
-	APIHash     string
-	Phone       string
-	Password    string // 2FA password (optional)
-	SessionPath string // Path to encrypted session file
+	APIID                     int
+	APIHash                   string
+	Phone                     string
+	Password                  string // 2FA password (optional)
+	SessionPath               string // Path to encrypted session file
+	SessionEncryptionPassword string // Password for session encryption
 
 	// Channel monitoring
 	MonitorChannels []int64 // Channel IDs to monitor for downloads
@@ -24,6 +25,18 @@ type Config struct {
 	// Download settings
 	DownloadDir            string
 	MaxConcurrentDownloads int
+
+	// Media library / Radarr
+	MediaDir             string // Root folder of the media collection
+	RadarrURL            string // Optional Radarr server URL
+	RadarrAPIKey         string // Optional Radarr API key
+	RadarrRootFolder     string // Radarr root folder for auto-added movies
+	RadarrQualityProfile int    // Radarr quality profile ID for auto-added movies
+	RadarrImportStrict   bool   // Only import exact title+year matches
+	PlexURL              string // Optional Plex server URL for scan triggers
+	PlexToken            string // Optional Plex API token
+	JellyfinURL          string // Optional Jellyfin server URL for scan triggers
+	JellyfinAPIKey       string // Optional Jellyfin API key
 
 	// Database
 	DatabasePath string
@@ -59,15 +72,26 @@ func Load() (*Config, error) {
 	}
 
 	cfg := &Config{
-		APIID:                  apiID,
-		APIHash:                apiHash,
-		Phone:                  phone,
-		Password:               os.Getenv("TELEGRAM_PASSWORD"),
-		SessionPath:            envOrDefault("SESSION_PATH", "./session.enc"),
-		DownloadDir:            envOrDefault("DOWNLOAD_DIR", "./downloads"),
-		MaxConcurrentDownloads: envOrDefaultInt("MAX_CONCURRENT_DOWNLOADS", 3),
-		DatabasePath:           envOrDefault("DATABASE_PATH", "./tele-downloader.db"),
-		LogLevelValue:          envOrDefault("LOG_LEVEL", "info"),
+		APIID:                     apiID,
+		APIHash:                   apiHash,
+		Phone:                     phone,
+		Password:                  os.Getenv("TELEGRAM_PASSWORD"),
+		SessionPath:               envOrDefault("SESSION_PATH", "./session.enc"),
+		SessionEncryptionPassword: getSessionEncryptionPassword(),
+		DownloadDir:               envOrDefault("DOWNLOAD_DIR", "./downloads"),
+		MaxConcurrentDownloads:    envOrDefaultInt("MAX_CONCURRENT_DOWNLOADS", 3),
+		MediaDir:                  os.Getenv("MEDIA_DIR"),
+		RadarrURL:                 os.Getenv("RADARR_URL"),
+		RadarrAPIKey:              os.Getenv("RADARR_API_KEY"),
+		RadarrRootFolder:          os.Getenv("RADARR_ROOT_FOLDER"),
+		RadarrQualityProfile:      envOrDefaultInt("RADARR_QUALITY_PROFILE_ID", 1),
+		RadarrImportStrict:        envOrDefaultBool("RADARR_IMPORT_STRICT", false),
+		PlexURL:                   os.Getenv("PLEX_URL"),
+		PlexToken:                 os.Getenv("PLEX_TOKEN"),
+		JellyfinURL:               os.Getenv("JELLYFIN_URL"),
+		JellyfinAPIKey:            os.Getenv("JELLYFIN_API_KEY"),
+		DatabasePath:              envOrDefault("DATABASE_PATH", "./tele-downloader.db"),
+		LogLevelValue:             envOrDefault("LOG_LEVEL", "info"),
 	}
 
 	// Parse channel IDs to monitor
@@ -115,6 +139,27 @@ func envOrDefaultInt(key string, defaultVal int) int {
 		return defaultVal
 	}
 	return n
+}
+
+func envOrDefaultBool(key string, defaultVal bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultVal
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return defaultVal
+	}
+	return b
+}
+
+// getSessionEncryptionPassword returns the session encryption password.
+// If 2FA password is set, it uses that. Otherwise, it uses SESSION_ENCRYPTION_PASSWORD.
+func getSessionEncryptionPassword() string {
+	if password := os.Getenv("TELEGRAM_PASSWORD"); password != "" {
+		return password
+	}
+	return os.Getenv("SESSION_ENCRYPTION_PASSWORD")
 }
 
 // loadEnvFile reads a .env file and sets environment variables.

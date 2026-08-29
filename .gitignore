@@ -20,6 +20,9 @@ go.work
 
 # Database files
 *.db
+*.db-wal
+*.db-shm
+*.db-journal
 *.sqlite
 
 # Session files (encrypted)
@@ -33,6 +36,9 @@ downloads/
 .env
 .env.local
 .env.*.local
+
+# Local container data (session, db, downloads)
+data_tmp/
 
 # IDE
 .vscode/
