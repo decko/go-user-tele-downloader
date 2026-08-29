@@ -66,14 +66,100 @@ To find a channel ID:
 2. The bot will show the channel ID (negative number)
 3. Use this ID in `MONITOR_CHANNELS`
 
+## Container (GHCR)
+
+A container image is published to GHCR on every push to `main`:
+**`ghcr.io/decko/go-user-tele-downloader:latest`**
+
+The image does **not** contain your Telegram session — you mount it in. This keeps your identity out of the image and the repo.
+
+### 1. Prepare your identity
+
+```bash
+mkdir -p ~/telecli-identity
+cp /path/to/your/session.enc ~/telecli-identity/
+```
+
+### 2. Prepare the environment file
+
+Create `~/.config/telecli/telecli.env` with your settings, using the **container paths** shown below:
+
+```ini
+TELEGRAM_API_ID=123456
+TELEGRAM_API_HASH=your_api_hash
+TELEGRAM_PHONE=+1234567890
+TELEGRAM_PASSWORD=your 2fa password
+MONITOR_CHANNELS=-1001234567890
+
+# Container paths (keep these as-is)
+SESSION_PATH=/identity/session.enc
+DOWNLOAD_DIR=/data/downloads
+DATABASE_PATH=/data/tele-downloader.db
+
+# Optional: Radarr
+# RADARR_URL=http://host.containers.internal:7878
+# RADARR_API_KEY=your_key
+# RADARR_ROOT_FOLDER=/media/movies
+# RADARR_QUALITY_PROFILE_ID=1
+# RADARR_IMPORT_STRICT=true
+```
+
+> **Note:** values in `--env-file` must **not** be wrapped in quotes (Podman does not strip them).
+
+### 3. Pull and run
+
+```bash
+podman pull ghcr.io/decko/go-user-tele-downloader:latest
+
+podman run -d \
+  --name telecli \
+  --env-file ~/.config/telecli/telecli.env \
+  -v ~/telecli-identity:/identity:Z \
+  -v ~/movies-downloads:/data/downloads:U,Z \
+  -v ~/telecli-data:/data:U,Z \
+  ghcr.io/decko/go-user-tele-downloader:latest
+```
+
+### Mounts
+
+| Mount | In-container path | Purpose |
+|-------|-------------------|---------|
+| `~/telecli-identity` | `/identity` | `session.enc` — your Telegram identity |
+| `~/movies-downloads` | `/data/downloads` | Downloaded files |
+| `~/telecli-data` | `/data` | SQLite database |
+
+The `:U` flag chowns the mount to the container user (UID 1000); `:Z` fixes SELinux labels. If `session.enc` is a single file, you may also mount it directly with `-v ~/path/session.enc:/identity/session.enc:Z`.
+
+### First-time authentication
+
+On the very first run, authenticate **interactively** once so the session is created and saved into the mounted identity folder:
+
+```bash
+podman run -it --rm \
+  --env-file ~/.config/telecli/telecli.env \
+  -v ~/telecli-identity:/identity:Z \
+  -v ~/movies-downloads:/data/downloads:U,Z \
+  -v ~/telecli-data:/data:U,Z \
+  ghcr.io/decko/go-user-tele-downloader:latest start
+```
+
+Enter the verification code, wait for `already authenticated`, then press **Ctrl+C**. Subsequent runs reuse the saved session automatically.
+
+### Building locally
+
+```bash
+podman build -t go-user-tele-downloader .
+```
+
 ## Architecture
 
 ```
-cmd/client/          → Entry point
-internal/client/     → MTProto client, authentication, channel monitoring, download engine
+cmd/telecli/          → CLI entry point
+internal/client/     → MTProto client, auth, channel monitoring, download engine, status messages
 internal/domain/     → Business logic services
 internal/model/      → Domain types (Download, User, Chat)
 internal/repository/ → Database implementations (SQLite)
+internal/radarr/     → Radarr API client + import orchestrator
 internal/config/     → Configuration loading
 internal/migration/  → Database migrations
 ```
@@ -265,7 +351,8 @@ make dev
 - ✅ **Phase 2**: Authentication System - Interactive/headless auth, session encryption
 - ✅ **Phase 3**: Channel Monitoring - Update subscription, message filtering
 - ✅ **Phase 4**: File Download Engine - Progress tracking, resume, parallel downloads
-- ⏳ **Phase 5**: CLI & Daemon Mode - Command-line interface, systemd integration (planned)
+- ✅ **Phase 5**: CLI & Daemon Mode - Command-line interface, systemd integration
+- ✅ **Radarr Integration** - Opt-in auto-import with confidence guard
 
 See [docs/implementation-summary.md](docs/implementation-summary.md) for detailed implementation notes.
 
