@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"strings"
+	"sync"
 
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
@@ -24,6 +26,7 @@ type TelegramClient struct {
 	logger            *slog.Logger
 	downloadEngine    *DownloadEngine
 	channelAccessHash map[int64]int64 // cached channel access hashes
+	accessHashMu      sync.Mutex      // guards channelAccessHash
 	radarrImporter    *radarr.Importer
 }
 
@@ -72,6 +75,9 @@ func (c *TelegramClient) Start(ctx context.Context) error {
 
 		// Initialize download engine
 		c.downloadEngine = NewDownloadEngine(c.api, c.logger)
+
+		// Start the queue-state notifier goroutine.
+		go c.runQueueNotifier(ctx)
 
 		// Initialize Radarr importer if configured
 		if c.config.RadarrURL != "" && c.config.RadarrAPIKey != "" {
@@ -481,14 +487,18 @@ func (c *TelegramClient) downloadFile(ctx context.Context, download *model.Downl
 }
 
 // resolveChannelAccessHash resolves and caches the access hash for a channel.
-// This is needed to send/edit messages in the channel.
+// This is needed to send/edit messages in the channel. The cache is guarded by
+// accessHashMu because it is accessed from both the update handler and the
+// queue notifier goroutine.
 func (c *TelegramClient) resolveChannelAccessHash(ctx context.Context, channelID int64) int64 {
-	// Check cache first
-	if hash, ok := c.channelAccessHash[channelID]; ok {
+	c.accessHashMu.Lock()
+	hash, ok := c.channelAccessHash[channelID]
+	c.accessHashMu.Unlock()
+	if ok {
 		return hash
 	}
 
-	// Resolve channel info
+	// Cache miss: resolve channel info (network call, outside the lock).
 	resp, err := c.api.ChannelsGetChannels(ctx, []tg.InputChannelClass{
 		&tg.InputChannel{
 			ChannelID:  channelID,
@@ -507,11 +517,70 @@ func (c *TelegramClient) resolveChannelAccessHash(ctx context.Context, channelID
 
 	for _, chat := range chats.Chats {
 		if ch, ok := chat.(*tg.Channel); ok && ch.ID == channelID {
+			c.accessHashMu.Lock()
 			c.channelAccessHash[channelID] = ch.AccessHash
+			c.accessHashMu.Unlock()
 			c.logger.Info("resolved channel access hash", "channel_id", channelID, "hash", ch.AccessHash)
 			return ch.AccessHash
 		}
 	}
 
 	return 0
+}
+
+// runQueueNotifier sends a queue-state message to the monitored channel(s)
+// whenever the number of queued downloads changes.
+//
+// Trade-off: we send a NEW message on every change rather than editing a single
+// "live" message. A live message is less noisy but can scroll out of view among
+// the per-file progress messages; per-change messages are noisier but always
+// visible. Chosen deliberately — see memory note (2026-09-08).
+func (c *TelegramClient) runQueueNotifier(ctx context.Context) {
+	for {
+		select {
+		case queued := <-c.service.QueueChanges():
+			for _, fullID := range c.config.MonitorChannels {
+				peer := c.resolveChannelPeer(ctx, fullID)
+				if peer == nil {
+					continue
+				}
+				if err := c.sendQueueMessage(ctx, peer, queued); err != nil {
+					c.logger.Warn("failed to send queue message", "queued", queued, "error", err)
+				}
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// resolveChannelPeer builds an input peer for a monitored channel ID, resolving
+// and caching its access hash. It returns nil if the peer cannot be resolved.
+func (c *TelegramClient) resolveChannelPeer(ctx context.Context, fullID int64) tg.InputPeerClass {
+	bare := -1000000000000 - fullID
+	hash := c.resolveChannelAccessHash(ctx, bare)
+	if hash == 0 {
+		return nil
+	}
+	return &tg.InputPeerChannel{ChannelID: bare, AccessHash: hash}
+}
+
+// sendQueueMessage posts the current queue state to a channel.
+func (c *TelegramClient) sendQueueMessage(ctx context.Context, peer tg.InputPeerClass, queued int64) error {
+	_, err := c.api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+		Peer:      peer,
+		Message:   queueStateMessage(queued),
+		NoWebpage: true,
+		RandomID:  rand.Int63(),
+	})
+	return err
+}
+
+// queueStateMessage renders the queue state as a user-facing message showing
+// only the queued (waiting) count.
+func queueStateMessage(queued int64) string {
+	if queued <= 0 {
+		return "Queue empty"
+	}
+	return fmt.Sprintf("Queue: %d waiting", queued)
 }
