@@ -17,17 +17,17 @@ func TestDownloadService_AcquireRelease_LimitsConcurrency(t *testing.T) {
 	ctx := context.Background()
 
 	// Fill both slots.
-	if err := s.Acquire(ctx); err != nil {
+	if err := s.Acquire(ctx, "a"); err != nil {
 		t.Fatalf("acquire slot 1: %v", err)
 	}
-	if err := s.Acquire(ctx); err != nil {
+	if err := s.Acquire(ctx, "b"); err != nil {
 		t.Fatalf("acquire slot 2: %v", err)
 	}
 
 	// A third acquire must block until a slot is released.
 	third := make(chan error, 1)
 	go func() {
-		if err := s.Acquire(ctx); err != nil {
+		if err := s.Acquire(ctx, "c"); err != nil {
 			third <- err
 			return
 		}
@@ -58,14 +58,14 @@ func TestDownloadService_AcquireRelease_LimitsConcurrency(t *testing.T) {
 // ctx.Err() instead of blocking forever when the context is cancelled.
 func TestDownloadService_Acquire_ContextCancelled(t *testing.T) {
 	s := NewDownloadService(nil, "", 1)
-	if err := s.Acquire(context.Background()); err != nil {
+	if err := s.Acquire(context.Background(), "a"); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if err := s.Acquire(ctx); err == nil {
+	if err := s.Acquire(ctx, "b"); err == nil {
 		t.Fatal("expected error when acquiring with a cancelled context")
 	}
 }
@@ -120,10 +120,10 @@ func TestDownloadService_QueueTracking(t *testing.T) {
 	}
 
 	// Acquires with free slots are not queued (fast path).
-	if err := s.Acquire(ctx); err != nil {
+	if err := s.Acquire(ctx, "a"); err != nil {
 		t.Fatalf("Acquire 1: %v", err)
 	}
-	if err := s.Acquire(ctx); err != nil {
+	if err := s.Acquire(ctx, "b"); err != nil {
 		t.Fatalf("Acquire 2: %v", err)
 	}
 	if got := s.Queued(); got != 0 {
@@ -132,12 +132,12 @@ func TestDownloadService_QueueTracking(t *testing.T) {
 
 	// The third acquire blocks (no free slot): queued goes to 1.
 	acquired := make(chan error, 1)
-	go func() { acquired <- s.Acquire(ctx) }()
+	go func() { acquired <- s.Acquire(ctx, "c") }()
 
 	select {
-	case n := <-changes:
-		if n != 1 {
-			t.Fatalf("queued change = %d, want 1", n)
+	case state := <-changes:
+		if state.Queued != 1 {
+			t.Fatalf("queued change = %d, want 1", state.Queued)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected queued change to 1")
@@ -149,9 +149,9 @@ func TestDownloadService_QueueTracking(t *testing.T) {
 		t.Fatalf("third Acquire: %v", err)
 	}
 	select {
-	case n := <-changes:
-		if n != 0 {
-			t.Fatalf("queued change = %d, want 0", n)
+	case state := <-changes:
+		if state.Queued != 0 {
+			t.Fatalf("queued change = %d, want 0", state.Queued)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected queued change to 0")
@@ -166,23 +166,23 @@ func TestDownloadService_QueueChanges(t *testing.T) {
 	changes := s.QueueChanges()
 
 	// Fill both slots via the fast path: no change should be emitted.
-	if err := s.Acquire(ctx); err != nil {
+	if err := s.Acquire(ctx, "a"); err != nil {
 		t.Fatalf("Acquire 1: %v", err)
 	}
-	if err := s.Acquire(ctx); err != nil {
+	if err := s.Acquire(ctx, "b"); err != nil {
 		t.Fatalf("Acquire 2: %v", err)
 	}
 	select {
-	case n := <-changes:
-		t.Fatalf("unexpected fast-path change = %d", n)
+	case state := <-changes:
+		t.Fatalf("unexpected fast-path change = %+v", state)
 	default:
 		// expected: silent
 	}
 
 	// Third acquire blocks: emits 1.
 	acquired := make(chan error, 1)
-	go func() { acquired <- s.Acquire(ctx) }()
-	if got := <-changes; got != 1 {
+	go func() { acquired <- s.Acquire(ctx, "c") }()
+	if got := (<-changes).Queued; got != 1 {
 		t.Fatalf("first change = %d, want 1", got)
 	}
 
@@ -191,7 +191,33 @@ func TestDownloadService_QueueChanges(t *testing.T) {
 	if err := <-acquired; err != nil {
 		t.Fatalf("third Acquire: %v", err)
 	}
-	if got := <-changes; got != 0 {
+	if got := (<-changes).Queued; got != 0 {
 		t.Fatalf("second change = %d, want 0", got)
+	}
+}
+
+// TestDownloadService_QueueItems verifies that the queue state carries the
+// names of the last (up to 3) downloads that were queued.
+func TestDownloadService_QueueItems(t *testing.T) {
+	s := NewDownloadService(fakeDownloadRepository{}, t.TempDir(), 2)
+
+	for _, name := range []string{"one", "two", "three", "four", "five"} {
+		s.enqueue(name)
+	}
+
+	// Drain the notifications; the last one carries the last 3 names.
+	var last QueueState
+	for i := 0; i < 5; i++ {
+		last = <-s.QueueChanges()
+	}
+
+	want := []string{"three", "four", "five"}
+	if len(last.Items) != len(want) {
+		t.Fatalf("items = %v, want %v", last.Items, want)
+	}
+	for i := range want {
+		if last.Items[i] != want[i] {
+			t.Fatalf("items[%d] = %q, want %q", i, last.Items[i], want[i])
+		}
 	}
 }

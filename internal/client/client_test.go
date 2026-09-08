@@ -4,22 +4,29 @@ import (
 	"testing"
 
 	"github.com/gotd/td/tg"
+
+	"github.com/decko/go-user-tele-downloader/internal/domain"
 )
 
 func TestQueueStateMessage(t *testing.T) {
 	tests := []struct {
-		queued int64
-		want   string
+		name  string
+		state domain.QueueState
+		want  string
 	}{
-		{0, "Queue empty"},
-		{-1, "Queue empty"},
-		{1, "Queue: 1 waiting"},
-		{5, "Queue: 5 waiting"},
+		{name: "empty", state: domain.QueueState{Queued: 0}, want: "⏳ Queue empty"},
+		{name: "negative", state: domain.QueueState{Queued: -1}, want: "⏳ Queue empty"},
+		{name: "one waiting", state: domain.QueueState{Queued: 1}, want: "⏳ Queue: 1 waiting"},
+		{
+			name:  "with items",
+			state: domain.QueueState{Queued: 3, Items: []string{"a.mkv", "b.mkv", "c.mkv"}},
+			want:  "⏳ Queue: 3 waiting\n\n• a.mkv\n• b.mkv\n• c.mkv",
+		},
 	}
 
 	for _, tc := range tests {
-		if got := queueStateMessage(tc.queued); got != tc.want {
-			t.Errorf("queueStateMessage(%d) = %q, want %q", tc.queued, got, tc.want)
+		if got := queueStateMessage(tc.state); got != tc.want {
+			t.Errorf("queueStateMessage(%+v) = %q, want %q", tc.state, got, tc.want)
 		}
 	}
 }

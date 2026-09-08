@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -15,6 +16,15 @@ import (
 	"github.com/decko/go-user-tele-downloader/internal/repository"
 )
 
+// QueueState describes the current download queue for notification purposes.
+type QueueState struct {
+	// Queued is the number of downloads currently waiting for a slot.
+	Queued int64
+	// Items are the names of the most recently queued downloads (up to the
+	// last 3).
+	Items []string
+}
+
 // DownloadService manages download operations.
 type DownloadService struct {
 	repo          repository.DownloadRepository
@@ -22,7 +32,9 @@ type DownloadService struct {
 	maxConcurrent int
 	sem           chan struct{}
 	queued        atomic.Int64
-	queueCh       chan int64
+	queueCh       chan QueueState
+	itemsMu       sync.Mutex
+	items         []string
 }
 
 // NewDownloadService creates a new download service.
@@ -35,7 +47,7 @@ func NewDownloadService(repo repository.DownloadRepository, downloadDir string, 
 		downloadDir:   downloadDir,
 		maxConcurrent: maxConcurrent,
 		sem:           make(chan struct{}, maxConcurrent),
-		queueCh:       make(chan int64, 256),
+		queueCh:       make(chan QueueState, 256),
 	}
 }
 
@@ -43,10 +55,10 @@ func NewDownloadService(repo repository.DownloadRepository, downloadDir string, 
 // maxConcurrent limit. It returns ctx.Err() if ctx is cancelled while waiting.
 // Every successful Acquire must be paired with exactly one Release.
 //
-// A download is only counted as "queued" when it cannot immediately obtain a
-// slot (all slots busy). Downloads that grab a free slot start immediately and
-// are never reflected in the queue count.
-func (s *DownloadService) Acquire(ctx context.Context) error {
+// name identifies the download and is recorded (last 3) when it blocks. A
+// download is only counted as "queued" when it cannot immediately obtain a slot
+// (all slots busy).
+func (s *DownloadService) Acquire(ctx context.Context, name string) error {
 	// Fast path: grab a free slot without waiting.
 	select {
 	case s.sem <- struct{}{}:
@@ -55,8 +67,7 @@ func (s *DownloadService) Acquire(ctx context.Context) error {
 	}
 
 	// All slots are busy: this download now waits in the queue.
-	s.queued.Add(1)
-	s.notifyQueue()
+	s.enqueue(name)
 
 	select {
 	case s.sem <- struct{}{}:
@@ -79,10 +90,23 @@ func (s *DownloadService) Queued() int64 {
 	return s.queued.Load()
 }
 
-// QueueChanges returns a channel that emits the queued count whenever it
+// QueueChanges returns a channel that emits the queue state whenever it
 // changes. Consumers must drain the channel promptly; the buffer is bounded.
-func (s *DownloadService) QueueChanges() <-chan int64 {
+func (s *DownloadService) QueueChanges() <-chan QueueState {
 	return s.queueCh
+}
+
+// enqueue records a download as waiting and adds its name to the recent-items
+// list (keeping only the last 3).
+func (s *DownloadService) enqueue(name string) {
+	s.queued.Add(1)
+	s.itemsMu.Lock()
+	s.items = append(s.items, name)
+	if len(s.items) > 3 {
+		s.items = s.items[len(s.items)-3:]
+	}
+	s.itemsMu.Unlock()
+	s.notifyQueue()
 }
 
 // dequeue decrements the queued count and notifies subscribers. It never
@@ -101,14 +125,17 @@ func (s *DownloadService) dequeue() {
 	}
 }
 
-// notifyQueue publishes the current queued count. The send is non-blocking: if
+// notifyQueue publishes the current queue state. The send is non-blocking: if
 // the consumer falls behind (buffer full), the update is dropped and the next
 // change publishes the latest value, so a slow consumer cannot stall download
 // creation or slot acquisition.
 func (s *DownloadService) notifyQueue() {
-	v := s.queued.Load()
+	s.itemsMu.Lock()
+	items := append([]string(nil), s.items...)
+	s.itemsMu.Unlock()
+	state := QueueState{Queued: s.queued.Load(), Items: items}
 	select {
-	case s.queueCh <- v:
+	case s.queueCh <- state:
 	default:
 	}
 }
