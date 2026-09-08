@@ -1,4 +1,4 @@
-.PHONY: build run dev test lint clean migrate install-service
+.PHONY: build run run-debug dev test lint clean migrate install-service
 
 BINARY=telecli
 GOFLAGS=-trimpath
@@ -11,6 +11,10 @@ build:
 # Run the binary
 run:
 	./bin/$(BINARY) start
+
+# Run the binary with debug logging
+run-debug:
+	LOG_LEVEL=debug ./bin/$(BINARY) start
 
 # Run in development mode (with hot reload)
 dev:

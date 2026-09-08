@@ -37,6 +37,9 @@ downloads/
 .env.local
 .env.*.local
 
+# Git worktrees (local task branches)
+.worktrees/
+
 # Local container data (session, db, downloads)
 data_tmp/
 
