@@ -43,10 +43,21 @@ func NewDownloadService(repo repository.DownloadRepository, downloadDir string, 
 // maxConcurrent limit. It returns ctx.Err() if ctx is cancelled while waiting.
 // Every successful Acquire must be paired with exactly one Release.
 //
-// A download is queued from CreateDownload until Acquire returns (either with a
-// slot or because the context was cancelled), so Acquire decrements the queued
-// count in both cases.
+// A download is only counted as "queued" when it cannot immediately obtain a
+// slot (all slots busy). Downloads that grab a free slot start immediately and
+// are never reflected in the queue count.
 func (s *DownloadService) Acquire(ctx context.Context) error {
+	// Fast path: grab a free slot without waiting.
+	select {
+	case s.sem <- struct{}{}:
+		return nil
+	default:
+	}
+
+	// All slots are busy: this download now waits in the queue.
+	s.queued.Add(1)
+	s.notifyQueue()
+
 	select {
 	case s.sem <- struct{}{}:
 		s.dequeue()
@@ -62,7 +73,8 @@ func (s *DownloadService) Release() {
 	<-s.sem
 }
 
-// Queued returns the number of downloads currently waiting for a slot.
+// Queued returns the number of downloads currently waiting (blocked) for a
+// slot.
 func (s *DownloadService) Queued() int64 {
 	return s.queued.Load()
 }
@@ -124,9 +136,6 @@ func (s *DownloadService) CreateDownload(ctx context.Context, chatID, userID int
 	if err := s.repo.Create(ctx, d); err != nil {
 		return nil, fmt.Errorf("creating download: %w", err)
 	}
-
-	s.queued.Add(1)
-	s.notifyQueue()
 
 	slog.Info("download created", "id", d.ID, "url", d.URL, "chat_id", chatID)
 	return d, nil

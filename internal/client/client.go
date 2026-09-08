@@ -27,6 +27,9 @@ type TelegramClient struct {
 	downloadEngine    *DownloadEngine
 	channelAccessHash map[int64]int64 // cached channel access hashes
 	accessHashMu      sync.Mutex      // guards channelAccessHash
+	queueMsgMu        sync.Mutex      // guards queueMsgID/queueMsgPeer
+	queueMsgID        int             // current queue message ID (0 = none)
+	queueMsgPeer      tg.InputPeerClass
 	radarrImporter    *radarr.Importer
 }
 
@@ -528,30 +531,91 @@ func (c *TelegramClient) resolveChannelAccessHash(ctx context.Context, channelID
 	return 0
 }
 
-// runQueueNotifier sends a queue-state message to the monitored channel(s)
-// whenever the number of queued downloads changes.
+// runQueueNotifier maintains a single queue-status message in the monitored
+// channel. It edits that message in place while the queue is non-empty, and
+// resets when the queue empties so the next burst starts with a fresh message.
 //
-// Trade-off: we send a NEW message on every change rather than editing a single
-// "live" message. A live message is less noisy but can scroll out of view among
-// the per-file progress messages; per-change messages are noisier but always
-// visible. Chosen deliberately — see memory note (2026-09-08).
+// Trade-off: an edit-in-place "live" message is far less noisy than one message
+// per change, but can scroll out of view during a long burst. Resetting on
+// queue-empty means each new burst begins with a fresh, visible message while
+// avoiding spam within a burst. Chosen deliberately — see memory note
+// (2026-09-08).
 func (c *TelegramClient) runQueueNotifier(ctx context.Context) {
 	for {
 		select {
 		case queued := <-c.service.QueueChanges():
-			for _, fullID := range c.config.MonitorChannels {
-				peer := c.resolveChannelPeer(ctx, fullID)
-				if peer == nil {
-					continue
-				}
-				if err := c.sendQueueMessage(ctx, peer, queued); err != nil {
-					c.logger.Warn("failed to send queue message", "queued", queued, "error", err)
-				}
-			}
+			c.updateQueueMessage(ctx, queued)
 		case <-ctx.Done():
 			return
 		}
 	}
+}
+
+// updateQueueMessage routes a queue change: finalize if the queue emptied,
+// otherwise upsert the active queue message.
+func (c *TelegramClient) updateQueueMessage(ctx context.Context, queued int64) {
+	if queued <= 0 {
+		c.finalizeQueueMessage(ctx)
+		return
+	}
+	c.upsertQueueMessage(ctx, queued)
+}
+
+// finalizeQueueMessage edits the current queue message to its final (empty)
+// state and clears the tracking so the next burst starts fresh.
+func (c *TelegramClient) finalizeQueueMessage(ctx context.Context) {
+	c.queueMsgMu.Lock()
+	id, peer := c.queueMsgID, c.queueMsgPeer
+	c.queueMsgID, c.queueMsgPeer = 0, nil
+	c.queueMsgMu.Unlock()
+
+	if id == 0 {
+		return
+	}
+	if err := c.editQueueMessage(ctx, peer, id, 0); err != nil {
+		c.logger.Warn("failed to finalize queue message", "error", err)
+	}
+}
+
+// upsertQueueMessage edits the current queue message if one exists, otherwise
+// sends a new one and records its ID.
+func (c *TelegramClient) upsertQueueMessage(ctx context.Context, queued int64) {
+	c.queueMsgMu.Lock()
+	id, peer := c.queueMsgID, c.queueMsgPeer
+	c.queueMsgMu.Unlock()
+
+	if id != 0 && peer != nil {
+		if err := c.editQueueMessage(ctx, peer, id, queued); err != nil {
+			c.logger.Warn("failed to edit queue message", "queued", queued, "error", err)
+		}
+		return
+	}
+
+	peer = c.resolveMonitoredPeer(ctx)
+	if peer == nil {
+		return
+	}
+	id, err := c.sendQueueMessage(ctx, peer, queued)
+	if err != nil {
+		c.logger.Warn("failed to send queue message", "queued", queued, "error", err)
+		return
+	}
+
+	c.queueMsgMu.Lock()
+	c.queueMsgID = id
+	c.queueMsgPeer = peer
+	c.queueMsgMu.Unlock()
+}
+
+// resolveMonitoredPeer returns the input peer of the first resolvable monitored
+// channel, or nil if none can be resolved.
+func (c *TelegramClient) resolveMonitoredPeer(ctx context.Context) tg.InputPeerClass {
+	for _, fullID := range c.config.MonitorChannels {
+		if peer := c.resolveChannelPeer(ctx, fullID); peer != nil {
+			return peer
+		}
+	}
+	return nil
 }
 
 // resolveChannelPeer builds an input peer for a monitored channel ID, resolving
@@ -565,15 +629,44 @@ func (c *TelegramClient) resolveChannelPeer(ctx context.Context, fullID int64) t
 	return &tg.InputPeerChannel{ChannelID: bare, AccessHash: hash}
 }
 
-// sendQueueMessage posts the current queue state to a channel.
-func (c *TelegramClient) sendQueueMessage(ctx context.Context, peer tg.InputPeerClass, queued int64) error {
-	_, err := c.api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+// sendQueueMessage posts the current queue state to a channel and returns the
+// sent message ID.
+func (c *TelegramClient) sendQueueMessage(ctx context.Context, peer tg.InputPeerClass, queued int64) (int, error) {
+	resp, err := c.api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 		Peer:      peer,
 		Message:   queueStateMessage(queued),
 		NoWebpage: true,
 		RandomID:  rand.Int63(),
 	})
+	if err != nil {
+		return 0, err
+	}
+	return extractMessageID(resp), nil
+}
+
+// editQueueMessage edits an existing queue message with the current queue state.
+func (c *TelegramClient) editQueueMessage(ctx context.Context, peer tg.InputPeerClass, messageID int, queued int64) error {
+	_, err := c.api.MessagesEditMessage(ctx, &tg.MessagesEditMessageRequest{
+		Peer:      peer,
+		ID:        messageID,
+		Message:   queueStateMessage(queued),
+		NoWebpage: true,
+	})
 	return err
+}
+
+// extractMessageID extracts the message ID from a send-message response.
+func extractMessageID(resp tg.UpdatesClass) int {
+	updates, ok := resp.(*tg.Updates)
+	if !ok {
+		return 0
+	}
+	for _, update := range updates.Updates {
+		if u, ok := update.(*tg.UpdateMessageID); ok {
+			return u.ID
+		}
+	}
+	return 0
 }
 
 // queueStateMessage renders the queue state as a user-facing message showing

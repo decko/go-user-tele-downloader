@@ -2,7 +2,6 @@ package domain
 
 import (
 	"context"
-	"fmt"
 	"testing"
 	"time"
 
@@ -94,54 +93,97 @@ func (fakeDownloadRepository) ListPending(_ context.Context, _ int) ([]*model.Do
 	return nil, nil
 }
 
-// TestDownloadService_QueueTracking verifies the queued counter: each created
-// download is queued until a slot is acquired.
+// TestDownloadService_QueueTracking verifies that "queued" counts only
+// downloads blocked waiting for a slot. Downloads that grab a free slot
+// immediately are never queued.
 func TestDownloadService_QueueTracking(t *testing.T) {
 	s := NewDownloadService(fakeDownloadRepository{}, t.TempDir(), 2)
+	ctx := context.Background()
+	changes := s.QueueChanges()
 
 	if got := s.Queued(); got != 0 {
 		t.Fatalf("initial queued = %d, want 0", got)
 	}
 
-	for i := 0; i < 2; i++ {
-		if _, err := s.CreateDownload(context.Background(), 1, 0, fmt.Sprintf("url-%d", i)); err != nil {
-			t.Fatalf("CreateDownload %d: %v", i, err)
-		}
-	}
-	if got := s.Queued(); got != 2 {
-		t.Fatalf("queued after 2 creates = %d, want 2", got)
-	}
-
-	if err := s.Acquire(context.Background()); err != nil {
-		t.Fatalf("Acquire: %v", err)
-	}
-	if got := s.Queued(); got != 1 {
-		t.Fatalf("queued after 1 acquire = %d, want 1", got)
-	}
-
-	if err := s.Acquire(context.Background()); err != nil {
-		t.Fatalf("Acquire: %v", err)
+	// Creating a download does not queue it.
+	if _, err := s.CreateDownload(ctx, 1, 0, "url"); err != nil {
+		t.Fatalf("CreateDownload: %v", err)
 	}
 	if got := s.Queued(); got != 0 {
-		t.Fatalf("queued after 2 acquires = %d, want 0", got)
+		t.Fatalf("queued after create = %d, want 0", got)
+	}
+
+	// Acquires with free slots are not queued (fast path).
+	if err := s.Acquire(ctx); err != nil {
+		t.Fatalf("Acquire 1: %v", err)
+	}
+	if err := s.Acquire(ctx); err != nil {
+		t.Fatalf("Acquire 2: %v", err)
+	}
+	if got := s.Queued(); got != 0 {
+		t.Fatalf("queued after filling slots = %d, want 0", got)
+	}
+
+	// The third acquire blocks (no free slot): queued goes to 1.
+	acquired := make(chan error, 1)
+	go func() { acquired <- s.Acquire(ctx) }()
+
+	select {
+	case n := <-changes:
+		if n != 1 {
+			t.Fatalf("queued change = %d, want 1", n)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected queued change to 1")
+	}
+
+	// Releasing a slot lets the blocked download proceed: queued returns to 0.
+	s.Release()
+	if err := <-acquired; err != nil {
+		t.Fatalf("third Acquire: %v", err)
+	}
+	select {
+	case n := <-changes:
+		if n != 0 {
+			t.Fatalf("queued change = %d, want 0", n)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected queued change to 0")
 	}
 }
 
-// TestDownloadService_QueueChanges verifies that QueueChanges emits the queued
-// count on every change, in order.
+// TestDownloadService_QueueChanges verifies QueueChanges emits only on blocked
+// transitions, in order, and stays silent on the fast path.
 func TestDownloadService_QueueChanges(t *testing.T) {
 	s := NewDownloadService(fakeDownloadRepository{}, t.TempDir(), 2)
+	ctx := context.Background()
 	changes := s.QueueChanges()
 
-	if _, err := s.CreateDownload(context.Background(), 1, 0, "url"); err != nil {
-		t.Fatalf("CreateDownload: %v", err)
+	// Fill both slots via the fast path: no change should be emitted.
+	if err := s.Acquire(ctx); err != nil {
+		t.Fatalf("Acquire 1: %v", err)
 	}
+	if err := s.Acquire(ctx); err != nil {
+		t.Fatalf("Acquire 2: %v", err)
+	}
+	select {
+	case n := <-changes:
+		t.Fatalf("unexpected fast-path change = %d", n)
+	default:
+		// expected: silent
+	}
+
+	// Third acquire blocks: emits 1.
+	acquired := make(chan error, 1)
+	go func() { acquired <- s.Acquire(ctx) }()
 	if got := <-changes; got != 1 {
 		t.Fatalf("first change = %d, want 1", got)
 	}
 
-	if err := s.Acquire(context.Background()); err != nil {
-		t.Fatalf("Acquire: %v", err)
+	// Release: emits 0.
+	s.Release()
+	if err := <-acquired; err != nil {
+		t.Fatalf("third Acquire: %v", err)
 	}
 	if got := <-changes; got != 0 {
 		t.Fatalf("second change = %d, want 0", got)
