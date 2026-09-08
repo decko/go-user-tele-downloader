@@ -57,6 +57,14 @@ var migrations = []struct {
 			applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		);`,
 	},
+	{
+		Name: "005_add_status_message_id_and_state",
+		SQL: `ALTER TABLE downloads ADD COLUMN status_message_id INTEGER NOT NULL DEFAULT 0;
+		CREATE TABLE IF NOT EXISTS state (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);`,
+	},
 }
 
 // Run applies all pending database migrations.

@@ -20,18 +20,19 @@ const (
 
 // Download represents a file download tracked by the system.
 type Download struct {
-	ID          string
-	ChatID      int64
-	UserID      int64
-	URL         string
-	FilePath    string
-	Status      DownloadStatus
-	Progress    float64
-	Error       string
-	FileSize    int64
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
-	CompletedAt *time.Time
+	ID              string
+	ChatID          int64
+	UserID          int64
+	URL             string
+	FilePath        string
+	Status          DownloadStatus
+	Progress        float64
+	Error           string
+	FileSize        int64
+	StatusMessageID int
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+	CompletedAt     *time.Time
 }
 
 // User represents a Telegram user who interacted with the bot.

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -15,6 +16,13 @@ import (
 	"github.com/decko/go-user-tele-downloader/internal/domain"
 	"github.com/decko/go-user-tele-downloader/internal/model"
 	"github.com/decko/go-user-tele-downloader/internal/radarr"
+	"github.com/decko/go-user-tele-downloader/internal/repository"
+)
+
+// State keys for persisting the current queue message across restarts.
+const (
+	stateQueueMessageID = "queue_message_id"
+	stateQueueChannelID = "queue_channel_id"
 )
 
 // TelegramClient wraps the MTProto client with download functionality.
@@ -31,13 +39,15 @@ type TelegramClient struct {
 	queueMsgID        int             // current queue message ID (0 = none)
 	queueMsgPeer      tg.InputPeerClass
 	radarrImporter    *radarr.Importer
+	stateRepo         repository.StateRepository
 }
 
 // New creates a new TelegramClient instance.
-func New(cfg *config.Config, service *domain.DownloadService, logger *slog.Logger) *TelegramClient {
+func New(cfg *config.Config, service *domain.DownloadService, stateRepo repository.StateRepository, logger *slog.Logger) *TelegramClient {
 	return &TelegramClient{
 		service:           service,
 		config:            cfg,
+		stateRepo:         stateRepo,
 		logger:            logger,
 		channelAccessHash: make(map[int64]int64),
 	}
@@ -78,6 +88,11 @@ func (c *TelegramClient) Start(ctx context.Context) error {
 
 		// Initialize download engine
 		c.downloadEngine = NewDownloadEngine(c.api, c.logger)
+
+		// Restore persisted queue-message state and finalize downloads left
+		// "downloading" by a previous run.
+		c.restoreQueueMessage(ctx)
+		c.handleInterruptedDownloads(ctx)
 
 		// Start the queue-state notifier goroutine.
 		go c.runQueueNotifier(ctx)
@@ -419,6 +434,10 @@ func (c *TelegramClient) downloadFile(ctx context.Context, download *model.Downl
 	if err := statusMsg.Start(ctx); err != nil {
 		c.logger.Warn("failed to send status message", "error", err)
 		// Don't fail the download if status message fails
+	} else if msgID := statusMsg.MessageID(); msgID != 0 {
+		if err := c.service.UpdateStatusMessageID(ctx, download.ID, msgID); err != nil {
+			c.logger.Warn("failed to persist status message id", "error", err)
+		}
 	}
 
 	// Configure download options
@@ -562,7 +581,8 @@ func (c *TelegramClient) updateQueueMessage(ctx context.Context, queued int64) {
 }
 
 // finalizeQueueMessage edits the current queue message to its final (empty)
-// state and clears the tracking so the next burst starts fresh.
+// state, clears the tracking, and removes the persisted state so the next burst
+// starts fresh.
 func (c *TelegramClient) finalizeQueueMessage(ctx context.Context) {
 	c.queueMsgMu.Lock()
 	id, peer := c.queueMsgID, c.queueMsgPeer
@@ -575,10 +595,11 @@ func (c *TelegramClient) finalizeQueueMessage(ctx context.Context) {
 	if err := c.editQueueMessage(ctx, peer, id, 0); err != nil {
 		c.logger.Warn("failed to finalize queue message", "error", err)
 	}
+	c.clearQueueMessage(ctx)
 }
 
 // upsertQueueMessage edits the current queue message if one exists, otherwise
-// sends a new one and records its ID.
+// sends a new one, records and persists its ID.
 func (c *TelegramClient) upsertQueueMessage(ctx context.Context, queued int64) {
 	c.queueMsgMu.Lock()
 	id, peer := c.queueMsgID, c.queueMsgPeer
@@ -591,31 +612,119 @@ func (c *TelegramClient) upsertQueueMessage(ctx context.Context, queued int64) {
 		return
 	}
 
-	peer = c.resolveMonitoredPeer(ctx)
+	// No current message: send a new one to the first resolvable channel.
+	for _, fullID := range c.config.MonitorChannels {
+		peer := c.resolveChannelPeer(ctx, fullID)
+		if peer == nil {
+			continue
+		}
+		id, err := c.sendQueueMessage(ctx, peer, queued)
+		if err != nil {
+			c.logger.Warn("failed to send queue message", "queued", queued, "error", err)
+			return
+		}
+
+		c.queueMsgMu.Lock()
+		c.queueMsgID = id
+		c.queueMsgPeer = peer
+		c.queueMsgMu.Unlock()
+
+		c.persistQueueMessage(ctx, fullID, id)
+		return
+	}
+}
+
+// persistQueueMessage stores the current queue message ID and channel so it can
+// be restored after a restart.
+func (c *TelegramClient) persistQueueMessage(ctx context.Context, fullID int64, messageID int) {
+	if err := c.stateRepo.Set(ctx, stateQueueMessageID, strconv.Itoa(messageID)); err != nil {
+		c.logger.Warn("failed to persist queue message id", "error", err)
+		return
+	}
+	if err := c.stateRepo.Set(ctx, stateQueueChannelID, strconv.FormatInt(fullID, 10)); err != nil {
+		c.logger.Warn("failed to persist queue channel id", "error", err)
+	}
+}
+
+// clearQueueMessage removes the persisted queue message state.
+func (c *TelegramClient) clearQueueMessage(ctx context.Context) {
+	if err := c.stateRepo.Delete(ctx, stateQueueMessageID); err != nil {
+		c.logger.Warn("failed to clear queue message id", "error", err)
+	}
+	if err := c.stateRepo.Delete(ctx, stateQueueChannelID); err != nil {
+		c.logger.Warn("failed to clear queue channel id", "error", err)
+	}
+}
+
+// restoreQueueMessage loads a previously persisted queue message so the
+// notifier resumes editing it instead of sending a new one.
+func (c *TelegramClient) restoreQueueMessage(ctx context.Context) {
+	idStr, err := c.stateRepo.Get(ctx, stateQueueMessageID)
+	if err != nil {
+		c.logger.Warn("failed to load queue message id", "error", err)
+		return
+	}
+	chStr, err := c.stateRepo.Get(ctx, stateQueueChannelID)
+	if err != nil {
+		c.logger.Warn("failed to load queue channel id", "error", err)
+		return
+	}
+	if idStr == "" || chStr == "" {
+		return
+	}
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		return
+	}
+	fullID, err := strconv.ParseInt(chStr, 10, 64)
+	if err != nil {
+		return
+	}
+	peer := c.resolveChannelPeer(ctx, fullID)
 	if peer == nil {
 		return
 	}
-	id, err := c.sendQueueMessage(ctx, peer, queued)
-	if err != nil {
-		c.logger.Warn("failed to send queue message", "queued", queued, "error", err)
-		return
-	}
-
 	c.queueMsgMu.Lock()
 	c.queueMsgID = id
 	c.queueMsgPeer = peer
 	c.queueMsgMu.Unlock()
+	c.logger.Info("restored queue message", "message_id", id, "channel_id", fullID)
 }
 
-// resolveMonitoredPeer returns the input peer of the first resolvable monitored
-// channel, or nil if none can be resolved.
-func (c *TelegramClient) resolveMonitoredPeer(ctx context.Context) tg.InputPeerClass {
-	for _, fullID := range c.config.MonitorChannels {
-		if peer := c.resolveChannelPeer(ctx, fullID); peer != nil {
-			return peer
+// handleInterruptedDownloads marks any downloads left in "downloading" state by
+// a previous run as failed and edits their status messages accordingly.
+func (c *TelegramClient) handleInterruptedDownloads(ctx context.Context) {
+	downloads, err := c.service.ListByStatus(ctx, model.DownloadStatusDownloading)
+	if err != nil {
+		c.logger.Warn("failed to list interrupted downloads", "error", err)
+		return
+	}
+	for _, d := range downloads {
+		if err := c.service.UpdateDownloadStatus(ctx, d.ID, model.DownloadStatusFailed, "interrupted by restart"); err != nil {
+			c.logger.Warn("failed to mark download interrupted", "id", d.ID, "error", err)
+			continue
+		}
+		if d.StatusMessageID == 0 {
+			continue
+		}
+		if peer := c.resolveChannelPeer(ctx, d.ChatID); peer != nil {
+			text := fmt.Sprintf("Download interrupted (bot restarted)\nFile: `%s`", d.URL)
+			if err := c.editStatusMessage(ctx, peer, d.StatusMessageID, text); err != nil {
+				c.logger.Warn("failed to edit interrupted status message", "id", d.ID, "error", err)
+			}
 		}
 	}
-	return nil
+}
+
+// editStatusMessage edits an existing message in a channel by ID.
+func (c *TelegramClient) editStatusMessage(ctx context.Context, peer tg.InputPeerClass, messageID int, text string) error {
+	_, err := c.api.MessagesEditMessage(ctx, &tg.MessagesEditMessageRequest{
+		Peer:      peer,
+		ID:        messageID,
+		Message:   text,
+		NoWebpage: true,
+	})
+	return err
 }
 
 // resolveChannelPeer builds an input peer for a monitored channel ID, resolving

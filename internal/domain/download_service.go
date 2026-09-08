@@ -187,3 +187,14 @@ func (s *DownloadService) UpdateDownloadStatus(ctx context.Context, id string, s
 func (s *DownloadService) UpdateDownloadProgress(ctx context.Context, id string, progress float64) error {
 	return s.repo.UpdateProgress(ctx, id, progress)
 }
+
+// UpdateStatusMessageID persists the Telegram message ID of a download's status
+// message so it can be edited after a restart.
+func (s *DownloadService) UpdateStatusMessageID(ctx context.Context, id string, messageID int) error {
+	return s.repo.UpdateStatusMessageID(ctx, id, messageID)
+}
+
+// ListByStatus retrieves downloads with the given status.
+func (s *DownloadService) ListByStatus(ctx context.Context, status model.DownloadStatus) ([]*model.Download, error) {
+	return s.repo.ListByStatus(ctx, status)
+}

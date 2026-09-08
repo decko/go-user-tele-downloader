@@ -17,7 +17,9 @@ type DownloadRepository interface {
 	ListAll(ctx context.Context) ([]*model.Download, error)
 	UpdateStatus(ctx context.Context, id string, status model.DownloadStatus, errMsg string) error
 	UpdateProgress(ctx context.Context, id string, progress float64) error
+	UpdateStatusMessageID(ctx context.Context, id string, messageID int) error
 	ListPending(ctx context.Context, limit int) ([]*model.Download, error)
+	ListByStatus(ctx context.Context, status model.DownloadStatus) ([]*model.Download, error)
 }
 
 // SQLiteDownloadRepository implements DownloadRepository using SQLite.
@@ -30,12 +32,30 @@ func NewSQLiteDownloadRepository(db *sql.DB) *SQLiteDownloadRepository {
 	return &SQLiteDownloadRepository{db: db}
 }
 
+// downloadColumns is the ordered SELECT column list shared by the read queries.
+const downloadColumns = `id, chat_id, user_id, url, file_path, status, progress, error, file_size, status_message_id, created_at, updated_at, completed_at`
+
+// scanDownload scans a row into d, handling the nullable completed_at.
+func scanDownload(scanner interface{ Scan(dest ...any) error }, d *model.Download) error {
+	var completedAt sql.NullTime
+	if err := scanner.Scan(
+		&d.ID, &d.ChatID, &d.UserID, &d.URL, &d.FilePath, &d.Status, &d.Progress, &d.Error,
+		&d.FileSize, &d.StatusMessageID, &d.CreatedAt, &d.UpdatedAt, &completedAt,
+	); err != nil {
+		return err
+	}
+	if completedAt.Valid {
+		d.CompletedAt = &completedAt.Time
+	}
+	return nil
+}
+
 // Create inserts a new download record.
 func (r *SQLiteDownloadRepository) Create(ctx context.Context, d *model.Download) error {
-	query := `INSERT INTO downloads (id, chat_id, user_id, url, file_path, status, progress, error, file_size, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	query := `INSERT INTO downloads (id, chat_id, user_id, url, file_path, status, progress, error, file_size, status_message_id, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	_, err := r.db.ExecContext(ctx, query,
-		d.ID, d.ChatID, d.UserID, d.URL, d.FilePath, d.Status, d.Progress, d.Error, d.FileSize, d.CreatedAt, d.UpdatedAt)
+		d.ID, d.ChatID, d.UserID, d.URL, d.FilePath, d.Status, d.Progress, d.Error, d.FileSize, d.StatusMessageID, d.CreatedAt, d.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("creating download: %w", err)
 	}
@@ -44,30 +64,44 @@ func (r *SQLiteDownloadRepository) Create(ctx context.Context, d *model.Download
 
 // GetByID retrieves a download by its ID.
 func (r *SQLiteDownloadRepository) GetByID(ctx context.Context, id string) (*model.Download, error) {
-	query := `SELECT id, chat_id, user_id, url, file_path, status, progress, error, file_size, created_at, updated_at, completed_at
-		FROM downloads WHERE id = ?`
+	query := `SELECT ` + downloadColumns + ` FROM downloads WHERE id = ?`
 	d := &model.Download{}
-	var completedAt sql.NullTime
-	err := r.db.QueryRowContext(ctx, query, id).Scan(
-		&d.ID, &d.ChatID, &d.UserID, &d.URL, &d.FilePath, &d.Status, &d.Progress, &d.Error,
-		&d.FileSize, &d.CreatedAt, &d.UpdatedAt, &completedAt)
-	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("download not found: %s", id)
-	}
-	if err != nil {
+	if err := scanDownload(r.db.QueryRowContext(ctx, query, id), d); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("download not found: %s", id)
+		}
 		return nil, fmt.Errorf("getting download: %w", err)
-	}
-	if completedAt.Valid {
-		d.CompletedAt = &completedAt.Time
 	}
 	return d, nil
 }
 
 // ListByChat retrieves downloads for a specific chat.
 func (r *SQLiteDownloadRepository) ListByChat(ctx context.Context, chatID int64, limit int) ([]*model.Download, error) {
-	query := `SELECT id, chat_id, user_id, url, file_path, status, progress, error, file_size, created_at, updated_at, completed_at
-		FROM downloads WHERE chat_id = ? ORDER BY created_at DESC LIMIT ?`
-	rows, err := r.db.QueryContext(ctx, query, chatID, limit)
+	query := `SELECT ` + downloadColumns + ` FROM downloads WHERE chat_id = ? ORDER BY created_at DESC LIMIT ?`
+	return r.queryDownloads(ctx, query, chatID, limit)
+}
+
+// ListAll retrieves all downloads.
+func (r *SQLiteDownloadRepository) ListAll(ctx context.Context) ([]*model.Download, error) {
+	query := `SELECT ` + downloadColumns + ` FROM downloads ORDER BY created_at DESC`
+	return r.queryDownloads(ctx, query)
+}
+
+// ListPending retrieves downloads with pending status.
+func (r *SQLiteDownloadRepository) ListPending(ctx context.Context, limit int) ([]*model.Download, error) {
+	query := `SELECT ` + downloadColumns + ` FROM downloads WHERE status = ? ORDER BY created_at ASC LIMIT ?`
+	return r.queryDownloads(ctx, query, model.DownloadStatusPending, limit)
+}
+
+// ListByStatus retrieves downloads with the given status.
+func (r *SQLiteDownloadRepository) ListByStatus(ctx context.Context, status model.DownloadStatus) ([]*model.Download, error) {
+	query := `SELECT ` + downloadColumns + ` FROM downloads WHERE status = ? ORDER BY created_at ASC`
+	return r.queryDownloads(ctx, query, status)
+}
+
+// queryDownloads runs a SELECT and scans all rows into downloads.
+func (r *SQLiteDownloadRepository) queryDownloads(ctx context.Context, query string, args ...any) ([]*model.Download, error) {
+	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("listing downloads: %w", err)
 	}
@@ -76,39 +110,8 @@ func (r *SQLiteDownloadRepository) ListByChat(ctx context.Context, chatID int64,
 	var downloads []*model.Download
 	for rows.Next() {
 		d := &model.Download{}
-		var completedAt sql.NullTime
-		if err := rows.Scan(&d.ID, &d.ChatID, &d.UserID, &d.URL, &d.FilePath, &d.Status, &d.Progress, &d.Error,
-			&d.FileSize, &d.CreatedAt, &d.UpdatedAt, &completedAt); err != nil {
+		if err := scanDownload(rows, d); err != nil {
 			return nil, fmt.Errorf("scanning download: %w", err)
-		}
-		if completedAt.Valid {
-			d.CompletedAt = &completedAt.Time
-		}
-		downloads = append(downloads, d)
-	}
-	return downloads, rows.Err()
-}
-
-// ListAll retrieves all downloads.
-func (r *SQLiteDownloadRepository) ListAll(ctx context.Context) ([]*model.Download, error) {
-	query := `SELECT id, chat_id, user_id, url, file_path, status, progress, error, file_size, created_at, updated_at, completed_at
-		FROM downloads ORDER BY created_at DESC`
-	rows, err := r.db.QueryContext(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("listing all downloads: %w", err)
-	}
-	defer rows.Close()
-
-	var downloads []*model.Download
-	for rows.Next() {
-		d := &model.Download{}
-		var completedAt sql.NullTime
-		if err := rows.Scan(&d.ID, &d.ChatID, &d.UserID, &d.URL, &d.FilePath, &d.Status, &d.Progress, &d.Error,
-			&d.FileSize, &d.CreatedAt, &d.UpdatedAt, &completedAt); err != nil {
-			return nil, fmt.Errorf("scanning download: %w", err)
-		}
-		if completedAt.Valid {
-			d.CompletedAt = &completedAt.Time
 		}
 		downloads = append(downloads, d)
 	}
@@ -143,28 +146,13 @@ func (r *SQLiteDownloadRepository) UpdateProgress(ctx context.Context, id string
 	return nil
 }
 
-// ListPending retrieves downloads with pending status.
-func (r *SQLiteDownloadRepository) ListPending(ctx context.Context, limit int) ([]*model.Download, error) {
-	query := `SELECT id, chat_id, user_id, url, file_path, status, progress, error, file_size, created_at, updated_at, completed_at
-		FROM downloads WHERE status = ? ORDER BY created_at ASC LIMIT ?`
-	rows, err := r.db.QueryContext(ctx, query, model.DownloadStatusPending, limit)
+// UpdateStatusMessageID persists the Telegram message ID of a download's status
+// message so it can be edited after a restart.
+func (r *SQLiteDownloadRepository) UpdateStatusMessageID(ctx context.Context, id string, messageID int) error {
+	query := `UPDATE downloads SET status_message_id = ?, updated_at = ? WHERE id = ?`
+	_, err := r.db.ExecContext(ctx, query, messageID, time.Now(), id)
 	if err != nil {
-		return nil, fmt.Errorf("listing pending downloads: %w", err)
+		return fmt.Errorf("updating status message id: %w", err)
 	}
-	defer rows.Close()
-
-	var downloads []*model.Download
-	for rows.Next() {
-		d := &model.Download{}
-		var completedAt sql.NullTime
-		if err := rows.Scan(&d.ID, &d.ChatID, &d.UserID, &d.URL, &d.FilePath, &d.Status, &d.Progress, &d.Error,
-			&d.FileSize, &d.CreatedAt, &d.UpdatedAt, &completedAt); err != nil {
-			return nil, fmt.Errorf("scanning download: %w", err)
-		}
-		if completedAt.Valid {
-			d.CompletedAt = &completedAt.Time
-		}
-		downloads = append(downloads, d)
-	}
-	return downloads, rows.Err()
+	return nil
 }

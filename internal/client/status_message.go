@@ -79,6 +79,13 @@ func (s *StatusMessage) Start(ctx context.Context) error {
 	return nil
 }
 
+// MessageID returns the ID of the status message, or 0 if it has not been sent.
+func (s *StatusMessage) MessageID() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.messageID
+}
+
 // Update edits the status message with current progress.
 // Rate-limited to at most one edit per 5 seconds.
 func (s *StatusMessage) Update(ctx context.Context, downloaded, total int64, speed float64) error {

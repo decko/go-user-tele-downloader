@@ -72,10 +72,11 @@ func runStart(cmd *cobra.Command, args []string) error {
 
 	// Initialize services
 	downloadRepo := repository.NewSQLiteDownloadRepository(db)
+	stateRepo := repository.NewSQLiteStateRepository(db)
 	downloadService := domain.NewDownloadService(downloadRepo, cfg.DownloadDir, cfg.MaxConcurrentDownloads)
 
 	// Initialize Telegram client
-	telegramClient := client.New(cfg, downloadService, logger)
+	telegramClient := client.New(cfg, downloadService, stateRepo, logger)
 
 	// Set up context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())

@@ -89,7 +89,13 @@ func (fakeDownloadRepository) UpdateStatus(_ context.Context, _ string, _ model.
 func (fakeDownloadRepository) UpdateProgress(_ context.Context, _ string, _ float64) error {
 	return nil
 }
+func (fakeDownloadRepository) UpdateStatusMessageID(_ context.Context, _ string, _ int) error {
+	return nil
+}
 func (fakeDownloadRepository) ListPending(_ context.Context, _ int) ([]*model.Download, error) {
+	return nil, nil
+}
+func (fakeDownloadRepository) ListByStatus(_ context.Context, _ model.DownloadStatus) ([]*model.Download, error) {
 	return nil, nil
 }
 
