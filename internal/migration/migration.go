@@ -86,12 +86,22 @@ func Run(db *sql.DB) error {
 			continue
 		}
 
-		if _, err := db.Exec(m.SQL); err != nil {
+		// Apply the migration and record it in one transaction, so a crash
+		// mid-migration rolls back instead of leaving a half-applied schema.
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("beginning migration %s: %w", m.Name, err)
+		}
+		if _, err := tx.Exec(m.SQL); err != nil {
+			_ = tx.Rollback()
 			return fmt.Errorf("applying migration %s: %w", m.Name, err)
 		}
-
-		if _, err := db.Exec("INSERT INTO schema_migrations (name) VALUES (?)", m.Name); err != nil {
+		if _, err := tx.Exec("INSERT INTO schema_migrations (name) VALUES (?)", m.Name); err != nil {
+			_ = tx.Rollback()
 			return fmt.Errorf("recording migration %s: %w", m.Name, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("committing migration %s: %w", m.Name, err)
 		}
 	}
 

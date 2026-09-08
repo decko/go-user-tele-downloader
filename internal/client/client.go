@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
@@ -78,6 +79,10 @@ func (c *TelegramClient) Start(ctx context.Context) error {
 
 	// Run client
 	return c.client.Run(ctx, func(ctx context.Context) error {
+		// Timestamp used to distinguish leftover downloads from a previous run
+		// from downloads that arrive after startup.
+		startupTime := time.Now()
+
 		// Authenticate if needed
 		if err := c.authenticate(ctx); err != nil {
 			return fmt.Errorf("authentication failed: %w", err)
@@ -92,7 +97,16 @@ func (c *TelegramClient) Start(ctx context.Context) error {
 		// Restore persisted queue-message state and finalize downloads left
 		// "downloading" by a previous run.
 		c.restoreQueueMessage(ctx)
-		c.handleInterruptedDownloads(ctx)
+		c.handleInterruptedDownloads(ctx, startupTime)
+
+		// If a queue message was restored but nothing is queued now, finalize
+		// the stale message so it does not linger as "N waiting".
+		c.queueMsgMu.Lock()
+		restored := c.queueMsgID != 0
+		c.queueMsgMu.Unlock()
+		if restored && c.service.Queued() == 0 {
+			c.finalizeQueueMessage(ctx)
+		}
 
 		// Start the queue-state notifier goroutine.
 		go c.runQueueNotifier(ctx)
@@ -473,12 +487,16 @@ func (c *TelegramClient) downloadFile(ctx context.Context, download *model.Downl
 	result, err := c.downloadEngine.Download(ctx, download, fileInfo, c.config.DownloadDir, opts)
 	if err != nil {
 		// Mark status message as failed
-		statusMsg.Fail(ctx, err.Error())
+		if failErr := statusMsg.Fail(ctx, err.Error()); failErr != nil {
+			c.logger.Warn("failed to mark status message failed", "error", failErr)
+		}
 		return err
 	}
 
 	// Mark status message as complete
-	statusMsg.Complete(ctx, result.FileSize, result.FileSize, result.Duration)
+	if completeErr := statusMsg.Complete(ctx, result.FileSize, result.FileSize, result.Duration); completeErr != nil {
+		c.logger.Warn("failed to mark status message complete", "error", completeErr)
+	}
 
 	// Update status to completed
 	if err := c.service.UpdateDownloadStatus(ctx, download.ID, model.DownloadStatusCompleted, ""); err != nil {
@@ -623,6 +641,10 @@ func (c *TelegramClient) upsertQueueMessage(ctx context.Context, queued int64) {
 			c.logger.Warn("failed to send queue message", "queued", queued, "error", err)
 			return
 		}
+		if id == 0 {
+			c.logger.Warn("sent queue message but could not extract its id")
+			return
+		}
 
 		c.queueMsgMu.Lock()
 		c.queueMsgID = id
@@ -691,15 +713,19 @@ func (c *TelegramClient) restoreQueueMessage(ctx context.Context) {
 	c.logger.Info("restored queue message", "message_id", id, "channel_id", fullID)
 }
 
-// handleInterruptedDownloads marks any downloads left in "downloading" state by
-// a previous run as failed and edits their status messages accordingly.
-func (c *TelegramClient) handleInterruptedDownloads(ctx context.Context) {
+// handleInterruptedDownloads marks downloads left in "downloading" state by a
+// previous run as failed and edits their status messages accordingly. Only
+// downloads updated before startupTime are considered leftovers.
+func (c *TelegramClient) handleInterruptedDownloads(ctx context.Context, startupTime time.Time) {
 	downloads, err := c.service.ListByStatus(ctx, model.DownloadStatusDownloading)
 	if err != nil {
 		c.logger.Warn("failed to list interrupted downloads", "error", err)
 		return
 	}
 	for _, d := range downloads {
+		if !d.UpdatedAt.Before(startupTime) {
+			continue // created/updated after startup; not a leftover
+		}
 		if err := c.service.UpdateDownloadStatus(ctx, d.ID, model.DownloadStatusFailed, "interrupted by restart"); err != nil {
 			c.logger.Warn("failed to mark download interrupted", "id", d.ID, "error", err)
 			continue
