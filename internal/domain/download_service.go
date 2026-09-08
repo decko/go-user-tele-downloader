@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,7 +20,6 @@ type DownloadService struct {
 	downloadDir   string
 	maxConcurrent int
 	sem           chan struct{}
-	mu            sync.Mutex
 }
 
 // NewDownloadService creates a new download service.
@@ -35,6 +33,23 @@ func NewDownloadService(repo repository.DownloadRepository, downloadDir string, 
 		maxConcurrent: maxConcurrent,
 		sem:           make(chan struct{}, maxConcurrent),
 	}
+}
+
+// Acquire blocks until a download slot is available, enforcing the configured
+// maxConcurrent limit. It returns ctx.Err() if ctx is cancelled while waiting.
+// Every successful Acquire must be paired with exactly one Release.
+func (s *DownloadService) Acquire(ctx context.Context) error {
+	select {
+	case s.sem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Release frees a download slot previously acquired with Acquire.
+func (s *DownloadService) Release() {
+	<-s.sem
 }
 
 // CreateDownload creates a new download request.

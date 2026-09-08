@@ -375,8 +375,14 @@ func (c *TelegramClient) createDownloadTask(ctx context.Context, channelID, mess
 		}
 	}
 
-	// Start download in background
+	// Start download in background, bounded by the configured concurrency limit.
 	go func() {
+		if err := c.service.Acquire(ctx); err != nil {
+			c.logger.Debug("download skipped while waiting for slot", "download_id", downloadID, "error", err)
+			return
+		}
+		defer c.service.Release()
+
 		if err := c.downloadFile(ctx, download, fileInfo, channelID, inputPeer, skipImport); err != nil {
 			c.logger.Error("download failed",
 				"download_id", downloadID,
