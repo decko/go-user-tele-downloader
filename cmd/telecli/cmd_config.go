@@ -42,6 +42,8 @@ func runConfig(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Max Concurrent:      %d\n", cfg.MaxConcurrentDownloads)
 	fmt.Printf("Log Level:           %s\n", cfg.LogLevelValue)
 	fmt.Printf("Monitor Channels:    %v\n", cfg.MonitorChannels)
+	fmt.Printf("Movie Channels:      %v\n", cfg.MovieChannels)
+	fmt.Printf("TV Channels:         %v\n", cfg.TVChannels)
 
 	return nil
 }
