@@ -81,6 +81,27 @@ Key types:
 - `Client`: lookup, add, episode lookup, manual import
 - `Importer`: orchestrates lookup → add (if missing) → manual import
 - `ParseName`: kind-aware filename parsing (movies: title+year; series: title+season+episodes via `SxxEyy` tokens)
+- `Item`/`AlternateTitle`: lookup results, including translated/alternate titles used for matching localized release filenames
+
+### Import Matching
+
+A completed download is matched to a library item by filename, scored by `matchConfidence` (0.8 exact title, 0.5 containment, ±year adjustment). The score is the best of the item's **primary** and **alternate** (translated) titles, so a Portuguese/Spanish release title can match an item indexed under its English title.
+
+Two safeguards prevent false positives:
+
+- **Localized year fallback** — when the title strings are unrelated but the lookup returns exactly one result whose `year` matches the filename year, it is accepted. This is gated to non-strict mode; `RADARR_IMPORT_STRICT`/`SONARR_IMPORT_STRICT` still require an exact title+year match.
+- **Empty-title guard** — `normalizeTitle` strips non-ASCII runes, so a non-Latin title normalizes to the empty string; `titleScore` treats empty inputs as no-match to avoid scoring 0.5 against arbitrary filenames.
+
+Import failures are reported distinctly: `lookup returned no results` (empty lookup) vs `no title match among N result(s)` (results found but none confident). Both wrap `ErrNoConfidentMatch`.
+
+### Import Result Notification
+
+After a download completes and an import is attempted, the same channel status message that shows download progress is edited to append a one-line outcome:
+
+- `✅ Added to Radarr: \`Title\`` / `✅ Added to Sonarr: \`Title\``
+- `⚠️ Not added to Radarr (no confident match)` (or `import failed` / `no episode in filename`)
+
+`#noimport` opt-outs and download-only channels produce no import line.
 
 ### Content-Type Routing
 

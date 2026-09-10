@@ -1,10 +1,12 @@
 package client
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/gotd/td/tg"
 
+	"github.com/decko/go-user-tele-downloader/internal/arr"
 	"github.com/decko/go-user-tele-downloader/internal/domain"
 )
 
@@ -28,6 +30,61 @@ func TestQueueStateMessage(t *testing.T) {
 		if got := queueStateMessage(tc.state); got != tc.want {
 			t.Errorf("queueStateMessage(%+v) = %q, want %q", tc.state, got, tc.want)
 		}
+	}
+}
+
+func TestImportResultMessage(t *testing.T) {
+	tests := []struct {
+		name  string
+		kind  arr.Kind
+		title string
+		err   error
+		want  string
+	}{
+		{
+			name:  "movie added",
+			kind:  arr.KindMovie,
+			title: "City of God",
+			want:  "✅ Added to Radarr: `City of God`",
+		},
+		{
+			name:  "series added",
+			kind:  arr.KindSeries,
+			title: "Show Name",
+			want:  "✅ Added to Sonarr: `Show Name`",
+		},
+		{
+			name: "movie no confident match",
+			kind: arr.KindMovie,
+			err:  arr.ErrNoConfidentMatch,
+			want: "⚠️ Not added to Radarr (no confident match)",
+		},
+		{
+			name: "series no episode",
+			kind: arr.KindSeries,
+			err:  arr.ErrNoEpisode,
+			want: "⚠️ Not added to Sonarr (no episode in filename)",
+		},
+		{
+			name: "movie generic error",
+			kind: arr.KindMovie,
+			err:  errors.New("boom"),
+			want: "⚠️ Not added to Radarr (import failed)",
+		},
+		{
+			name: "unknown kind does not render as Radarr",
+			kind: arr.Kind("music"),
+			err:  errors.New("boom"),
+			want: "⚠️ Not added to arr (import failed)",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := importResultMessage(tc.kind, tc.title, tc.err); got != tc.want {
+				t.Errorf("importResultMessage(%q, %q, %v) = %q, want %q", tc.kind, tc.title, tc.err, got, tc.want)
+			}
+		})
 	}
 }
 

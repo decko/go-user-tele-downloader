@@ -20,6 +20,15 @@ type ParsedName struct {
 	Episodes []int // empty for movies / files without an episode token
 }
 
+const (
+	// defaultThreshold is the minimum match confidence score required to import
+	// in non-strict mode.
+	defaultThreshold = 0.7
+	// strictThreshold is the minimum score required in strict mode (exact
+	// title + year).
+	strictThreshold = 1.0
+)
+
 // ErrNoConfidentMatch is returned when a filename cannot be confidently
 // matched to an item in the library. The file is left in the download folder
 // untouched.
@@ -86,14 +95,27 @@ func (i *Importer) ImportFile(ctx context.Context, path string) (string, error) 
 	}
 
 	// 2. Pick the best match by confidence.
+	if len(items) == 0 {
+		return "", fmt.Errorf("%w: lookup returned no results for %q", ErrNoConfidentMatch, term)
+	}
 	best, bestScore := i.bestMatch(parsed, items)
 	if best == nil {
-		return "", fmt.Errorf("%w: no results for %q", ErrNoConfidentMatch, term)
+		// Localized-release fallback: the filename title may be in another
+		// language than the *arr metadata title. A single lookup result whose
+		// year matches the filename is accepted in non-strict mode.
+		if !i.strict && len(items) == 1 && parsed.Year > 0 && items[0].Year == parsed.Year {
+			best = &items[0]
+			bestScore = defaultThreshold
+			i.logger.Info("accepting single year-matched result",
+				"kind", i.kind, "file", path, "title", best.Title, "year", best.Year)
+		} else {
+			return "", fmt.Errorf("%w: no title match among %d result(s) for %q", ErrNoConfidentMatch, len(items), term)
+		}
 	}
 
-	threshold := 0.7
+	threshold := defaultThreshold
 	if i.strict {
-		threshold = 1.0
+		threshold = strictThreshold
 	}
 	if bestScore < threshold {
 		i.logger.Warn("skipping import, weak match",
@@ -195,7 +217,27 @@ func mapEpisodeIDs(numbers []int, episodes []Episode) []int {
 	return ids
 }
 
-// matchConfidence scores how well a parsed filename matches an item.
+// titleScore returns the base title-match score between two already-normalized
+// titles: 0.8 exact, 0.5 containment, 0.0 otherwise. An empty title scores 0.0
+// so that a title which normalizes to "" (e.g. a non-Latin alternate title)
+// never matches every filename via strings.Contains.
+func titleScore(a, b string) float64 {
+	if a == "" || b == "" {
+		return 0.0
+	}
+	switch {
+	case a == b:
+		return 0.8
+	case strings.Contains(a, b) || strings.Contains(b, a):
+		return 0.5
+	}
+	return 0.0
+}
+
+// matchConfidence scores how well a parsed filename matches an item. The title
+// score is the best of the item's primary title and all of its alternate
+// (translated) titles, so a match may come from either the primary OR an
+// alternate title.
 //
 //	0.8  exact normalized title match
 //	0.5  one title contains the other
@@ -206,15 +248,12 @@ func mapEpisodeIDs(numbers []int, episodes []Episode) []int {
 // a year still score 0.8 and pass the default threshold.
 func matchConfidence(parsed ParsedName, item Item) float64 {
 	ft := normalizeTitle(parsed.Title)
-	mt := normalizeTitle(item.Title)
 
-	score := 0.0
-	switch {
-	case ft == mt:
-		score += 0.8
-	case strings.Contains(ft, mt) || strings.Contains(mt, ft):
-		score += 0.5
-	default:
+	score := titleScore(ft, normalizeTitle(item.Title))
+	for _, alt := range item.AlternateTitles {
+		score = max(score, titleScore(ft, normalizeTitle(alt.Title)))
+	}
+	if score == 0.0 {
 		return 0.0 // unrelated titles
 	}
 

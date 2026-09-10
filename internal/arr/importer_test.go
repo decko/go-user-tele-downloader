@@ -1,6 +1,12 @@
 package arr
 
 import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 )
 
@@ -159,6 +165,38 @@ func TestMatchConfidence(t *testing.T) {
 			item:     Item{Title: "Show Name", Year: 2020},
 			wantPass: false,
 		},
+		// --- Alternate-title scoring: localized release names should match
+		// the *arr primary (usually English) title. ---
+		{
+			name:     "exact alternate title match with year",
+			parsed:   ParsedName{Title: "Cidade de Deus", Year: 2002},
+			item:     Item{Title: "City of God", Year: 2002, AlternateTitles: []AlternateTitle{{Title: "Cidade de Deus"}}},
+			wantPass: true,
+		},
+		{
+			name:     "alternate title containment",
+			parsed:   ParsedName{Title: "Cidade", Year: 2002},
+			item:     Item{Title: "City of God", Year: 2002, AlternateTitles: []AlternateTitle{{Title: "Cidade de Deus"}}},
+			wantPass: true,
+		},
+		{
+			name:     "alternate title match but wrong year",
+			parsed:   ParsedName{Title: "Cidade de Deus", Year: 1999},
+			item:     Item{Title: "City of God", Year: 2002, AlternateTitles: []AlternateTitle{{Title: "Cidade de Deus"}}},
+			wantPass: false,
+		},
+		{
+			name:     "no primary or alternate match",
+			parsed:   ParsedName{Title: "Something Else"},
+			item:     Item{Title: "City of God", AlternateTitles: []AlternateTitle{{Title: "Cidade de Deus"}}},
+			wantPass: false,
+		},
+		{
+			name:     "non-latin alternate title does not match",
+			parsed:   ParsedName{Title: "Some Random Movie", Year: 2001},
+			item:     Item{Title: "Spirited Away", Year: 2001, AlternateTitles: []AlternateTitle{{Title: "千と千尋の神隠し"}}},
+			wantPass: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -211,6 +249,162 @@ func TestStrictThreshold(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestImportFile_LocalizedYearFallback covers a localized (non-English)
+// filename whose title does not match the *arr primary title, but whose year
+// matches a single lookup result. The importer should fall back to the
+// year match and complete the add + manual-import flow.
+func TestImportFile_LocalizedYearFallback(t *testing.T) {
+	const (
+		moviePath = "/downloads/Patrulha_Canina_Uma_Aventura_Dino_2026.1080p.mkv"
+		term      = "Patrulha Canina Uma Aventura Dino 2026"
+	)
+
+	fake := &fakeArr{
+		t: t,
+		expectations: []arrExpectation{
+			{
+				method:       http.MethodGet,
+				path:         "/api/v3/movie/lookup",
+				query:        url.Values{"term": {term}},
+				responseJSON: `[{"tmdbId":1185806,"title":"PAW Patrol: The Dino Movie","year":2026}]`,
+			},
+			{
+				method:       http.MethodPost,
+				path:         "/api/v3/movie",
+				responseJSON: `{"id":42}`,
+			},
+			{
+				method:       http.MethodGet,
+				path:         "/api/v3/movie/lookup",
+				query:        url.Values{"term": {term}},
+				responseJSON: `[{"id":42,"tmdbId":1185806,"title":"PAW Patrol: The Dino Movie","year":2026}]`,
+			},
+			{
+				method:       http.MethodPost,
+				path:         "/api/v3/manualimport",
+				responseJSON: `[]`,
+				checkBody: func(t *testing.T, body []byte) {
+					expectManualImportMovie(t, body, moviePath, 42)
+				},
+			},
+		},
+	}
+	server := httptest.NewServer(fake)
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-key", KindMovie)
+	imp := NewImporter(c, KindMovie, "/movies", 1, false, discardLogger())
+
+	title, err := imp.ImportFile(context.Background(), moviePath)
+	if err != nil {
+		t.Fatalf("ImportFile() error = %v", err)
+	}
+	if title != "PAW Patrol: The Dino Movie" {
+		t.Errorf("ImportFile() title = %q, want %q", title, "PAW Patrol: The Dino Movie")
+	}
+	fake.verify()
+}
+
+// TestImportFile_LocalizedStrictRejects covers the same localized filename in
+// strict mode: a year-only fallback must not satisfy the strict 1.0 threshold,
+// so the importer bails out after the lookup without adding anything.
+func TestImportFile_LocalizedStrictRejects(t *testing.T) {
+	const (
+		moviePath = "/downloads/Patrulha_Canina_Uma_Aventura_Dino_2026.1080p.mkv"
+		term      = "Patrulha Canina Uma Aventura Dino 2026"
+	)
+
+	fake := &fakeArr{
+		t: t,
+		expectations: []arrExpectation{
+			{
+				method:       http.MethodGet,
+				path:         "/api/v3/movie/lookup",
+				query:        url.Values{"term": {term}},
+				responseJSON: `[{"tmdbId":1185806,"title":"PAW Patrol: The Dino Movie","year":2026}]`,
+			},
+		},
+	}
+	server := httptest.NewServer(fake)
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-key", KindMovie)
+	imp := NewImporter(c, KindMovie, "/movies", 1, true, discardLogger())
+
+	_, err := imp.ImportFile(context.Background(), moviePath)
+	if !errors.Is(err, ErrNoConfidentMatch) {
+		t.Fatalf("ImportFile() error = %v, want wrapping %v", err, ErrNoConfidentMatch)
+	}
+	fake.verify()
+}
+
+// TestImportFile_LookupNoResults covers an empty lookup response. The error
+// must wrap ErrNoConfidentMatch and be distinguishable by its "no results"
+// text.
+func TestImportFile_LookupNoResults(t *testing.T) {
+	const term = "Some Title 2026"
+
+	fake := &fakeArr{
+		t: t,
+		expectations: []arrExpectation{
+			{
+				method:       http.MethodGet,
+				path:         "/api/v3/movie/lookup",
+				query:        url.Values{"term": {term}},
+				responseJSON: `[]`,
+			},
+		},
+	}
+	server := httptest.NewServer(fake)
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-key", KindMovie)
+	imp := NewImporter(c, KindMovie, "/movies", 1, false, discardLogger())
+
+	_, err := imp.ImportFile(context.Background(), "/downloads/Some.Title.2026.mkv")
+	if !errors.Is(err, ErrNoConfidentMatch) {
+		t.Fatalf("ImportFile() error = %v, want wrapping %v", err, ErrNoConfidentMatch)
+	}
+	if !strings.Contains(err.Error(), "no results") {
+		t.Errorf("ImportFile() error = %q, want it to contain %q", err, "no results")
+	}
+	fake.verify()
+}
+
+// TestImportFile_NoTitleMatch covers a lookup that returns results but none of
+// them match the filename title or year. The error must wrap
+// ErrNoConfidentMatch and be distinguishable from the empty-lookup case by its
+// "no title match" text.
+func TestImportFile_NoTitleMatch(t *testing.T) {
+	const term = "Some Title 2026"
+
+	fake := &fakeArr{
+		t: t,
+		expectations: []arrExpectation{
+			{
+				method:       http.MethodGet,
+				path:         "/api/v3/movie/lookup",
+				query:        url.Values{"term": {term}},
+				responseJSON: `[{"tmdbId":1,"title":"Completely Unrelated","year":2020},{"tmdbId":2,"title":"Also Unrelated","year":2021}]`,
+			},
+		},
+	}
+	server := httptest.NewServer(fake)
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-key", KindMovie)
+	imp := NewImporter(c, KindMovie, "/movies", 1, false, discardLogger())
+
+	_, err := imp.ImportFile(context.Background(), "/downloads/Some.Title.2026.mkv")
+	if !errors.Is(err, ErrNoConfidentMatch) {
+		t.Fatalf("ImportFile() error = %v, want wrapping %v", err, ErrNoConfidentMatch)
+	}
+	if !strings.Contains(err.Error(), "no title match") {
+		t.Errorf("ImportFile() error = %q, want it to contain %q", err, "no title match")
+	}
+	fake.verify()
 }
 
 // equalInts compares two int slices, treating nil and empty as equal.

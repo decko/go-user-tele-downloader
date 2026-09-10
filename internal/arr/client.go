@@ -44,6 +44,16 @@ type Item struct {
 	Title   string `json:"title"`
 	Year    int    `json:"year"`
 	HasFile bool   `json:"hasFile"`
+	// AlternateTitles lists translated/alternate titles returned by the *arr
+	// metadata provider, used to match localized release filenames whose
+	// primary title is in another language.
+	AlternateTitles []AlternateTitle `json:"alternateTitles"`
+}
+
+// AlternateTitle is a single translated/alternate title from the *arr metadata
+// provider.
+type AlternateTitle struct {
+	Title string `json:"title"`
 }
 
 // Episode is a single series episode record (for manual-import resolution).

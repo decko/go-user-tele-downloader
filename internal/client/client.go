@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -530,11 +531,11 @@ func (c *TelegramClient) downloadFile(ctx context.Context, download *model.Downl
 		switch c.config.ContentTypeFor(channelID) {
 		case config.ContentTypeMovie:
 			if c.movieImporter != nil {
-				c.importCompleted(ctx, "movie", c.movieImporter, result.FilePath)
+				c.importCompleted(ctx, arr.KindMovie, c.movieImporter, result.FilePath, statusMsg)
 			}
 		case config.ContentTypeSeries:
 			if c.seriesImporter != nil {
-				c.importCompleted(ctx, "series", c.seriesImporter, result.FilePath)
+				c.importCompleted(ctx, arr.KindSeries, c.seriesImporter, result.FilePath, statusMsg)
 			}
 		case config.ContentTypeDownloadOnly:
 			c.logger.Info("download-only channel, skipping arr import", "file", result.FilePath)
@@ -544,16 +545,22 @@ func (c *TelegramClient) downloadFile(ctx context.Context, download *model.Downl
 	return nil
 }
 
-// importCompleted routes a completed download through the given importer and
-// logs the outcome. Import failures are logged but never fail the download.
-func (c *TelegramClient) importCompleted(ctx context.Context, kind string, importer *arr.Importer, path string) {
+// importCompleted routes a completed download through the given importer,
+// logs the outcome, and appends the result line to the download's status
+// message. Import failures are logged but never fail the download.
+func (c *TelegramClient) importCompleted(ctx context.Context, kind arr.Kind, importer *arr.Importer, path string, statusMsg *StatusMessage) {
 	c.logger.Info("importing download into arr", "kind", kind, "file", path)
 	title, err := importer.ImportFile(ctx, path)
 	if err != nil {
 		c.logger.Error("arr import failed", "kind", kind, "file", path, "error", err)
-		return
+	} else {
+		c.logger.Info("arr import triggered", "kind", kind, "title", title, "file", path)
 	}
-	c.logger.Info("arr import triggered", "kind", kind, "title", title, "file", path)
+	if statusMsg != nil {
+		if editErr := statusMsg.ImportResult(ctx, importResultMessage(kind, title, err)); editErr != nil {
+			c.logger.Warn("failed to update status message with import result", "error", editErr)
+		}
+	}
 }
 
 // resolveChannelAccessHash resolves and caches the access hash for a channel.
@@ -857,6 +864,33 @@ func extractMessageID(resp tg.UpdatesClass) int {
 		}
 	}
 	return 0
+}
+
+// importResultMessage renders the one-line import outcome appended to the
+// "Download Complete" status message. kind selects the target system; a nil err
+// renders a success line, a non-nil err renders a failure line with a short
+// reason.
+func importResultMessage(kind arr.Kind, title string, err error) string {
+	system := "Radarr"
+	switch kind {
+	case arr.KindMovie:
+		system = "Radarr"
+	case arr.KindSeries:
+		system = "Sonarr"
+	default:
+		system = "arr"
+	}
+	if err == nil {
+		return fmt.Sprintf("✅ Added to %s: `%s`", system, title)
+	}
+	reason := "import failed"
+	switch {
+	case errors.Is(err, arr.ErrNoConfidentMatch):
+		reason = "no confident match"
+	case errors.Is(err, arr.ErrNoEpisode):
+		reason = "no episode in filename"
+	}
+	return fmt.Sprintf("⚠️ Not added to %s (%s)", system, reason)
 }
 
 // queueStateMessage renders the queue state as a user-facing message showing

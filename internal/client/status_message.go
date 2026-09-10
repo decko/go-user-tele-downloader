@@ -22,6 +22,7 @@ type StatusMessage struct {
 	messageID int
 	startTime time.Time
 	lastEdit  time.Time
+	lastText  string // last message text sent/edited, guarded by mu
 	mu        sync.Mutex
 	logger    *slog.Logger
 }
@@ -45,6 +46,7 @@ func (s *StatusMessage) Start(ctx context.Context) error {
 	defer s.mu.Unlock()
 
 	msg := s.buildMessage(0, 0, 0, "Starting...")
+	s.lastText = msg
 
 	// Send message to channel using the resolved peer
 	req := &tg.MessagesSendMessageRequest{
@@ -107,6 +109,7 @@ func (s *StatusMessage) Update(ctx context.Context, downloaded, total int64, spe
 	}
 
 	msg := s.buildMessage(downloaded, total, eta, "")
+	s.lastText = msg
 
 	// Edit the message
 	_, err := s.api.MessagesEditMessage(ctx, &tg.MessagesEditMessageRequest{
@@ -144,6 +147,7 @@ func (s *StatusMessage) Complete(ctx context.Context, downloaded, total int64, d
 		formatDuration(duration),
 		speed/1024/1024,
 	)
+	s.lastText = msg
 
 	_, err := s.api.MessagesEditMessage(ctx, &tg.MessagesEditMessageRequest{
 		Peer:      s.peer,
@@ -174,6 +178,7 @@ func (s *StatusMessage) Fail(ctx context.Context, errMsg string) error {
 		s.fileInfo.Name,
 		errMsg,
 	)
+	s.lastText = msg
 
 	_, editErr := s.api.MessagesEditMessage(ctx, &tg.MessagesEditMessageRequest{
 		Peer:      s.peer,
@@ -185,6 +190,31 @@ func (s *StatusMessage) Fail(ctx context.Context, errMsg string) error {
 		return fmt.Errorf("failed to edit status message: %w", editErr)
 	}
 
+	return nil
+}
+
+// ImportResult appends the import outcome line to the completed status message
+// and edits it in place. It is a no-op if the message was never sent or line is
+// empty.
+func (s *StatusMessage) ImportResult(ctx context.Context, line string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.messageID == 0 || line == "" {
+		return nil
+	}
+
+	msg := s.lastText + "\n\n" + line
+	_, err := s.api.MessagesEditMessage(ctx, &tg.MessagesEditMessageRequest{
+		Peer:      s.peer,
+		ID:        s.messageID,
+		Message:   msg,
+		NoWebpage: true,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to edit status message with import result: %w", err)
+	}
+	s.lastText = msg
 	return nil
 }
 
