@@ -71,6 +71,30 @@ Environment-based configuration:
 - 2FA password (optional)
 - Channel IDs to monitor
 - Download settings
+- Channel routing (`MOVIE_CHANNELS`, `TV_CHANNELS`) and *arr connection settings
+
+### 6. Media Library Integration (`internal/arr`)
+
+A single *arr client/importer parameterized by `Kind` (`movie` → Radarr, `series` → Sonarr). Radarr and Sonarr share the same v3 API surface, so the client differs only in the resource noun (`movie` vs `series`) and a few payload field names (`tmdbId` vs `tvdbId`, `movieId` vs `seriesId`).
+
+Key types:
+- `Client`: lookup, add, episode lookup, manual import
+- `Importer`: orchestrates lookup → add (if missing) → manual import
+- `ParseName`: kind-aware filename parsing (movies: title+year; series: title+season+episodes via `SxxEyy` tokens)
+
+### Content-Type Routing
+
+The channel is the **single source of truth** for content type — routing never guesses from filenames:
+
+```
+content type = f(channel):
+  no routing configured (both lists empty) → movie  (backward compatible)
+  channel ∈ MOVIE_CHANNELS → movie   → Radarr
+  channel ∈ TV_CHANNELS    → series  → Sonarr
+  otherwise (monitored)    → download-only
+```
+
+`MOVIE_CHANNELS` and `TV_CHANNELS` are disjoint subsets of `MONITOR_CHANNELS`; overlap or non-subset fails validation at startup. The `#noimport` caption opt-out skips import for all content types.
 
 ## Data Flow
 

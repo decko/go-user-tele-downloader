@@ -22,27 +22,98 @@ type Config struct {
 	// Channel monitoring
 	MonitorChannels []int64 // Channel IDs to monitor for downloads
 
+	// Channel routing
+	MovieChannels []int64 // Channels routed to Radarr (movies)
+	TVChannels    []int64 // Channels routed to Sonarr (series)
+
 	// Download settings
 	DownloadDir            string
 	MaxConcurrentDownloads int
 
-	// Media library / Radarr
+	// Media library / Radarr (movies)
 	MediaDir             string // Root folder of the media collection
 	RadarrURL            string // Optional Radarr server URL
 	RadarrAPIKey         string // Optional Radarr API key
 	RadarrRootFolder     string // Radarr root folder for auto-added movies
 	RadarrQualityProfile int    // Radarr quality profile ID for auto-added movies
 	RadarrImportStrict   bool   // Only import exact title+year matches
-	PlexURL              string // Optional Plex server URL for scan triggers
-	PlexToken            string // Optional Plex API token
-	JellyfinURL          string // Optional Jellyfin server URL for scan triggers
-	JellyfinAPIKey       string // Optional Jellyfin API key
+
+	// Media library / Sonarr (series)
+	SonarrURL            string // Optional Sonarr server URL
+	SonarrAPIKey         string // Optional Sonarr API key
+	SonarrRootFolder     string // Sonarr root folder for auto-added series
+	SonarrQualityProfile int    // Sonarr quality profile ID for auto-added series
+	SonarrImportStrict   bool   // Only import exact title+year matches
+
+	PlexURL        string // Optional Plex server URL for scan triggers
+	PlexToken      string // Optional Plex API token
+	JellyfinURL    string // Optional Jellyfin server URL for scan triggers
+	JellyfinAPIKey string // Optional Jellyfin API key
 
 	// Database
 	DatabasePath string
 
 	// Logging
 	LogLevelValue string
+}
+
+// ContentType classifies how a downloaded file is routed after completion.
+type ContentType int
+
+const (
+	// ContentTypeMovie routes to Radarr.
+	ContentTypeMovie ContentType = iota
+	// ContentTypeSeries routes to Sonarr.
+	ContentTypeSeries
+	// ContentTypeDownloadOnly leaves the file in downloads/ (no import).
+	ContentTypeDownloadOnly
+)
+
+// ContentTypeFor returns the routing type for a monitored channel. When no
+// routing is configured (both lists empty) every channel is a movie for
+// backward compatibility. Otherwise unlisted channels are download-only.
+func (c *Config) ContentTypeFor(channelID int64) ContentType {
+	if len(c.MovieChannels) == 0 && len(c.TVChannels) == 0 {
+		return ContentTypeMovie
+	}
+	if containsChannel(c.MovieChannels, channelID) {
+		return ContentTypeMovie
+	}
+	if containsChannel(c.TVChannels, channelID) {
+		return ContentTypeSeries
+	}
+	return ContentTypeDownloadOnly
+}
+
+// Validate checks that MOVIE_CHANNELS and TV_CHANNELS are disjoint and both
+// are subsets of MONITOR_CHANNELS.
+func (c *Config) Validate() error {
+	for _, id := range c.MovieChannels {
+		if containsChannel(c.TVChannels, id) {
+			return fmt.Errorf("channel %d is listed in both MOVIE_CHANNELS and TV_CHANNELS", id)
+		}
+	}
+	for _, id := range c.MovieChannels {
+		if !containsChannel(c.MonitorChannels, id) {
+			return fmt.Errorf("MOVIE_CHANNELS channel %d is not in MONITOR_CHANNELS", id)
+		}
+	}
+	for _, id := range c.TVChannels {
+		if !containsChannel(c.MonitorChannels, id) {
+			return fmt.Errorf("TV_CHANNELS channel %d is not in MONITOR_CHANNELS", id)
+		}
+	}
+	return nil
+}
+
+// containsChannel reports whether channelID is present in ids.
+func containsChannel(ids []int64, channelID int64) bool {
+	for _, id := range ids {
+		if id == channelID {
+			return true
+		}
+	}
+	return false
 }
 
 // Load reads configuration from environment variables.
@@ -86,6 +157,11 @@ func Load() (*Config, error) {
 		RadarrRootFolder:          os.Getenv("RADARR_ROOT_FOLDER"),
 		RadarrQualityProfile:      envOrDefaultInt("RADARR_QUALITY_PROFILE_ID", 1),
 		RadarrImportStrict:        envOrDefaultBool("RADARR_IMPORT_STRICT", false),
+		SonarrURL:                 os.Getenv("SONARR_URL"),
+		SonarrAPIKey:              os.Getenv("SONARR_API_KEY"),
+		SonarrRootFolder:          os.Getenv("SONARR_ROOT_FOLDER"),
+		SonarrQualityProfile:      envOrDefaultInt("SONARR_QUALITY_PROFILE_ID", 1),
+		SonarrImportStrict:        envOrDefaultBool("SONARR_IMPORT_STRICT", false),
 		PlexURL:                   os.Getenv("PLEX_URL"),
 		PlexToken:                 os.Getenv("PLEX_TOKEN"),
 		JellyfinURL:               os.Getenv("JELLYFIN_URL"),
@@ -94,18 +170,40 @@ func Load() (*Config, error) {
 		LogLevelValue:             envOrDefault("LOG_LEVEL", "info"),
 	}
 
-	// Parse channel IDs to monitor
-	if channels := os.Getenv("MONITOR_CHANNELS"); channels != "" {
-		for _, s := range strings.Split(channels, ",") {
-			id, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
-			if err != nil {
-				return nil, fmt.Errorf("parsing MONITOR_CHANNELS: %w", err)
-			}
-			cfg.MonitorChannels = append(cfg.MonitorChannels, id)
-		}
+	// Parse channel IDs to monitor and route.
+	if cfg.MonitorChannels, err = parseChannels("MONITOR_CHANNELS", os.Getenv("MONITOR_CHANNELS")); err != nil {
+		return nil, err
+	}
+	if cfg.MovieChannels, err = parseChannels("MOVIE_CHANNELS", os.Getenv("MOVIE_CHANNELS")); err != nil {
+		return nil, err
+	}
+	if cfg.TVChannels, err = parseChannels("TV_CHANNELS", os.Getenv("TV_CHANNELS")); err != nil {
+		return nil, err
+	}
+
+	if err := cfg.Validate(); err != nil {
+		return nil, err
 	}
 
 	return cfg, nil
+}
+
+// parseChannels parses a comma-separated list of int64 channel IDs. It returns
+// nil for an empty value. The key is used only in error messages.
+func parseChannels(key, value string) ([]int64, error) {
+	if value == "" {
+		return nil, nil
+	}
+
+	var channels []int64
+	for _, s := range strings.Split(value, ",") {
+		id, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parsing %s: %w", key, err)
+		}
+		channels = append(channels, id)
+	}
+	return channels, nil
 }
 
 // LogLevel returns the slog.Level for the configured log level.
@@ -169,7 +267,7 @@ func loadEnvFile(path string) {
 	if err != nil {
 		return // .env file is optional
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -196,7 +294,7 @@ func loadEnvFile(path string) {
 
 		// Don't override existing environment variables
 		if os.Getenv(key) == "" {
-			os.Setenv(key, value)
+			_ = os.Setenv(key, value)
 		}
 	}
 }

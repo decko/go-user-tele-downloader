@@ -14,10 +14,10 @@ import (
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
 
+	"github.com/decko/go-user-tele-downloader/internal/arr"
 	"github.com/decko/go-user-tele-downloader/internal/config"
 	"github.com/decko/go-user-tele-downloader/internal/domain"
 	"github.com/decko/go-user-tele-downloader/internal/model"
-	"github.com/decko/go-user-tele-downloader/internal/radarr"
 	"github.com/decko/go-user-tele-downloader/internal/repository"
 )
 
@@ -41,7 +41,8 @@ type TelegramClient struct {
 	queueMsgID        int             // current queue message ID (0 = none)
 	queueMsgPeer      tg.InputPeerClass
 	latestMsgID       atomic.Int64 // highest message ID seen/sent (staleness)
-	radarrImporter    *radarr.Importer
+	movieImporter     *arr.Importer
+	seriesImporter    *arr.Importer
 	stateRepo         repository.StateRepository
 }
 
@@ -113,11 +114,16 @@ func (c *TelegramClient) Start(ctx context.Context) error {
 		// Start the queue-state notifier goroutine.
 		go c.runQueueNotifier(ctx)
 
-		// Initialize Radarr importer if configured
+		// Initialize Radarr (movies) and Sonarr (series) importers if configured.
 		if c.config.RadarrURL != "" && c.config.RadarrAPIKey != "" {
-			rc := radarr.NewClient(c.config.RadarrURL, c.config.RadarrAPIKey)
-			c.radarrImporter = radarr.NewImporter(rc, c.config.RadarrRootFolder, c.config.RadarrQualityProfile, c.config.RadarrImportStrict, c.logger)
+			rc := arr.NewClient(c.config.RadarrURL, c.config.RadarrAPIKey, arr.KindMovie)
+			c.movieImporter = arr.NewImporter(rc, arr.KindMovie, c.config.RadarrRootFolder, c.config.RadarrQualityProfile, c.config.RadarrImportStrict, c.logger)
 			c.logger.Info("radarr integration enabled", "url", c.config.RadarrURL, "strict", c.config.RadarrImportStrict)
+		}
+		if c.config.SonarrURL != "" && c.config.SonarrAPIKey != "" {
+			sc := arr.NewClient(c.config.SonarrURL, c.config.SonarrAPIKey, arr.KindSeries)
+			c.seriesImporter = arr.NewImporter(sc, arr.KindSeries, c.config.SonarrRootFolder, c.config.SonarrQualityProfile, c.config.SonarrImportStrict, c.logger)
+			c.logger.Info("sonarr integration enabled", "url", c.config.SonarrURL, "strict", c.config.SonarrImportStrict)
 		}
 
 		c.logger.Info("client started", "phone", c.config.Phone)
@@ -256,7 +262,7 @@ func (c *TelegramClient) handleChannelMessage(ctx context.Context, update *tg.Up
 		return nil
 	}
 
-	// Check if the user opted out of Radarr import for this file.
+	// Check if the user opted out of importing this file into Radarr/Sonarr.
 	skipImport := strings.Contains(strings.ToLower(msg.Message), "#noimport")
 
 	c.logger.Info("file detected in channel",
@@ -265,7 +271,7 @@ func (c *TelegramClient) handleChannelMessage(ctx context.Context, update *tg.Up
 		"file_name", fileInfo.Name,
 		"file_size", fileInfo.Size,
 		"mime_type", fileInfo.MimeType,
-		"skip_radarr_import", skipImport,
+		"skip_import", skipImport,
 	)
 
 	// Create download task
@@ -518,18 +524,36 @@ func (c *TelegramClient) downloadFile(ctx context.Context, download *model.Downl
 		"resumed", result.Resumed,
 	)
 
-	// Optionally import the file into Radarr (opt-in via config, per-file opt-out via #noimport).
-	if !skipImport && c.radarrImporter != nil {
-		c.logger.Info("importing download into radarr", "file", result.FilePath)
-		title, err := c.radarrImporter.ImportFile(ctx, result.FilePath)
-		if err != nil {
-			c.logger.Error("radarr import failed", "file", result.FilePath, "error", err)
-		} else {
-			c.logger.Info("radarr import triggered", "title", title, "file", result.FilePath)
+	// Optionally import the file into Radarr or Sonarr based on the channel's
+	// content type (opt-in via config, per-file opt-out via #noimport).
+	if !skipImport {
+		switch c.config.ContentTypeFor(channelID) {
+		case config.ContentTypeMovie:
+			if c.movieImporter != nil {
+				c.importCompleted(ctx, "movie", c.movieImporter, result.FilePath)
+			}
+		case config.ContentTypeSeries:
+			if c.seriesImporter != nil {
+				c.importCompleted(ctx, "series", c.seriesImporter, result.FilePath)
+			}
+		case config.ContentTypeDownloadOnly:
+			c.logger.Info("download-only channel, skipping arr import", "file", result.FilePath)
 		}
 	}
 
 	return nil
+}
+
+// importCompleted routes a completed download through the given importer and
+// logs the outcome. Import failures are logged but never fail the download.
+func (c *TelegramClient) importCompleted(ctx context.Context, kind string, importer *arr.Importer, path string) {
+	c.logger.Info("importing download into arr", "kind", kind, "file", path)
+	title, err := importer.ImportFile(ctx, path)
+	if err != nil {
+		c.logger.Error("arr import failed", "kind", kind, "file", path, "error", err)
+		return
+	}
+	c.logger.Info("arr import triggered", "kind", kind, "title", title, "file", path)
 }
 
 // resolveChannelAccessHash resolves and caches the access hash for a channel.

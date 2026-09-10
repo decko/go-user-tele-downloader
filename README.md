@@ -159,7 +159,7 @@ internal/client/     → MTProto client, auth, channel monitoring, download engi
 internal/domain/     → Business logic services
 internal/model/      → Domain types (Download, User, Chat)
 internal/repository/ → Database implementations (SQLite)
-internal/radarr/     → Radarr API client + import orchestrator
+internal/arr/        → Radarr/Sonarr API client + import orchestrator
 internal/config/     → Configuration loading
 internal/migration/  → Database migrations
 ```
@@ -193,15 +193,17 @@ MAX_CONCURRENT_DOWNLOADS=3
 SESSION_PATH=./session.enc
 ```
 
-## Radarr Integration (optional)
+## Radarr & Sonarr Integration (optional)
 
-When configured, completed downloads are automatically imported into your Radarr library:
+Completed downloads can be automatically imported into **Radarr** (movies) and/or **Sonarr** (series). Both share the same v3 API (Sonarr is a Radarr fork), so a single `internal/arr` client/importer drives both.
 
-1. **Lookup** — the file is identified via Radarr's TMDB-backed lookup
-2. **Auto-add** — if the movie isn't in Radarr yet, it's added (uses `RADARR_ROOT_FOLDER` and `RADARR_QUALITY_PROFILE_ID`)
-3. **Import** — Radarr renames, moves, and triggers your library scan
+Each import follows the same flow:
 
-**Enable it** by setting these in your `.env`:
+1. **Lookup** — the file is identified via a metadata-backed lookup (TMDB for movies, TVDB for series)
+2. **Auto-add** — if the title isn't in the library yet, it's added (uses the configured root folder and quality profile)
+3. **Import** — the *arr system renames, moves, and triggers your library scan
+
+**Enable Radarr** by setting these in your `.env`:
 
 ```bash
 RADARR_URL=http://localhost:7878
@@ -210,22 +212,56 @@ RADARR_ROOT_FOLDER=/media/movies
 RADARR_QUALITY_PROFILE_ID=1
 ```
 
-**Strict matching** (recommended): only import when the filename matches a movie exactly — title AND year. Prevents weak matches from polluting your library:
+**Enable Sonarr** by setting these in your `.env`:
+
+```bash
+SONARR_URL=http://localhost:8989
+SONARR_API_KEY=your_key
+SONARR_ROOT_FOLDER=/media/tv
+SONARR_QUALITY_PROFILE_ID=1
+```
+
+**Strict matching** (recommended): only import when the filename matches the title exactly — title AND year. Prevents weak matches from polluting your library. The two systems have independent flags:
 
 ```bash
 RADARR_IMPORT_STRICT=true
+SONARR_IMPORT_STRICT=true
 ```
 
-Without strict mode, a filename that partially matches a movie (e.g., a documentary named after a movie) may be auto-added and imported under the wrong title. Files that don't match confidently are **left in `downloads/` untouched** — they're never deleted or mis-imported silently.
+> Note: series filenames rarely include a year, so `SONARR_IMPORT_STRICT` (which requires a matching year) will reject most series. Leave it unset (`false`) unless your TV releases embed years.
 
-**Per-file opt-out:** append `#noimport` to the channel message caption — the file downloads normally but stays in `downloads/` without touching Radarr.
+Without strict mode, a filename that partially matches a title may be auto-added and imported under the wrong title. Files that don't match confidently are **left in `downloads/` untouched** — they're never deleted or mis-imported silently.
+
+**Per-file opt-out:** append `#noimport` to the channel message caption — the file downloads normally but stays in `downloads/` without touching Radarr or Sonarr.
+
+### Content-Type Routing
+
+By default (no routing configured), **all** monitored channels import into Radarr (backward-compatible behavior). To split movies and TV, tag channels explicitly:
+
+```bash
+# What to watch (single source of truth)
+MONITOR_CHANNELS=-1001000000001,-1001000000002,-1001000000003
+
+# Route by channel (disjoint subsets of MONITOR_CHANNELS)
+MOVIE_CHANNELS=-1001000000001
+TV_CHANNELS=-1001000000002
+```
+
+- A channel in `MOVIE_CHANNELS` → imported into **Radarr**
+- A channel in `TV_CHANNELS` → imported into **Sonarr**
+- A monitored channel in **neither** list → **download-only** (left in `downloads/`)
+
+`MOVIE_CHANNELS` and `TV_CHANNELS` must be disjoint and must be subsets of `MONITOR_CHANNELS`; misconfiguration fails loudly at startup.
 
 **Manual import** of existing files:
 
 ```bash
 telecli import /data/downloads/Movie.2026.1080p.mkv
+telecli import --type series /data/downloads/Show.S01E02.1080p.mkv
 telecli import /data/downloads/Some.Folder
 ```
+
+`--type` selects the target system (`movie` → Radarr, `series` → Sonarr) and defaults to `movie`.
 
 ## CLI Commands
 
