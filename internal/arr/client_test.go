@@ -106,6 +106,51 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// TestLookupDecodesAlternateTitles verifies that Lookup decodes the
+// alternateTitles array (each element an object with a title field) into
+// Item.AlternateTitles.
+func TestLookupDecodesAlternateTitles(t *testing.T) {
+	const lookupJSON = `[{"id":0,"tmdbId":1185806,"title":"PAW Patrol: The Dino Movie","year":2026,"hasFile":false,"alternateTitles":[{"sourceType":"tmdb","title":"Patrulha Canina: Um Filme Dinossáurico"},{"sourceType":"tmdb","title":"La Patrulla Canina: La Dino Película"}]}]`
+
+	fake := &fakeArr{
+		t: t,
+		expectations: []arrExpectation{
+			{
+				method:       http.MethodGet,
+				path:         "/api/v3/movie/lookup",
+				query:        url.Values{"term": {"PAW Patrol 2026"}},
+				responseJSON: lookupJSON,
+			},
+		},
+	}
+	server := httptest.NewServer(fake)
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-key", KindMovie)
+	items, err := c.Lookup(context.Background(), "PAW Patrol 2026")
+	if err != nil {
+		t.Fatalf("Lookup() error = %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("Lookup() returned %d items, want 1", len(items))
+	}
+
+	got := items[0].AlternateTitles
+	if len(got) != 2 {
+		t.Fatalf("Lookup() AlternateTitles length = %d, want 2", len(got))
+	}
+	want := []string{
+		"Patrulha Canina: Um Filme Dinossáurico",
+		"La Patrulla Canina: La Dino Película",
+	}
+	for i, w := range want {
+		if got[i].Title != w {
+			t.Errorf("AlternateTitles[%d].Title = %q, want %q", i, got[i].Title, w)
+		}
+	}
+	fake.verify()
+}
+
 func TestImportFile_MovieFlow(t *testing.T) {
 	const moviePath = "/downloads/Movie.Name.2026.1080p.WEB-DL.mkv"
 
