@@ -171,7 +171,9 @@ func (c *Client) get(ctx context.Context, path string, params url.Values, out an
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusOK {
+	// Lookup/episode endpoints return 200 on success; accept the full 2xx
+	// range to stay consistent with post (which tolerates 201 Created).
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		return fmt.Errorf("arr returned %d: %s", resp.StatusCode, string(body))
 	}
